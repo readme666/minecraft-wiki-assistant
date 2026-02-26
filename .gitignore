@@ -48,4 +48,5 @@ Thumbs.db
 .idea/
 *.spec
 *.un~
-
+# Hugging face cache
+.hf_cache
