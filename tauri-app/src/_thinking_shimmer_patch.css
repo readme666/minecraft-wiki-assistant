@@ -1,0 +1,43 @@
+﻿.bubble.thinking {
+  position: relative;
+  color: transparent;
+  overflow: hidden;
+}
+
+.bubble.thinking::before {
+  content: attr(data-thinking-text);
+  position: absolute;
+  inset: 0;
+  padding: var(--bubble-pad-y) var(--bubble-pad-x);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #9aa0a6;
+  pointer-events: none;
+}
+
+.bubble.thinking::after {
+  content: attr(data-thinking-text);
+  position: absolute;
+  inset: 0;
+  padding: var(--bubble-pad-y) var(--bubble-pad-x);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: linear-gradient(90deg, transparent 0%, #e5e5e5 45%, transparent 90%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  pointer-events: none;
+  transform: translateX(-120%);
+  animation: shimmer-sweep var(--thinking-shimmer-speed) linear infinite;
+}
+
+@keyframes shimmer-sweep {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(120%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bubble.thinking::after {
+    animation: none !important;
+  }
+}

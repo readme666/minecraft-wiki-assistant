@@ -1,0 +1,51 @@
+~__pycache__/
+data/
+datasets/
+index/
+indexes/
+chunks/
+titles/
+pyserver/__pycache__/
+tauri-app/src-tauri/target/
+.vscode/
+xml/
+tauri-app/src-tauri/icons/
+tauri-app/node_modules/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+#Python pakages for test
+python/
+# Data / RAG
+data/
+*.jsonl
+*.db
+*.sqlite
+
+# Executables
+*.exe
+
+# Tauri build output
+tauri-app/dist/
+tauri-app/src-tauri/target/
+
+# Rust build
+target/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.spec
+*.un~
+

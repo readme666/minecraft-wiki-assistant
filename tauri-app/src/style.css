@@ -1,0 +1,498 @@
+﻿:root {
+  --bg: #0f0f0f;
+  --panel: #121212;
+  --text: #e5e5e5;
+  --muted: #9aa0a6;
+  --bubble-user: #2a3440;
+  --bubble-assistant: #1a1a1a;
+  --border: #2a2a2a;
+  --accent: #3a4555;
+  --error-bg: #3b1f1f;
+  --error-border: #5a2a2a;
+  --font-size: 14px;
+
+  /* thinking shimmer speed */
+  --thinking-shimmer-speed: 4.24s;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+body, html {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100%;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  width: 220px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 16px;
+}
+
+.session-header {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.session-item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--text);
+  background: transparent;
+}
+
+.session-item.active {
+  background: #1b1b1b;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.title {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.status {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status.running {
+  color: #cdd3da;
+  animation: status-pulse 1.4s ease-out infinite;
+  will-change: transform, opacity;
+}
+
+.btn {
+  background: #2a2a2a;
+  color: var(--text);
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: #333333;
+}
+
+.btn.ghost {
+  background: transparent;
+}
+
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 6px;
+}
+
+.message-row {
+  display: flex;
+  width: 100%;
+}
+
+.message-row.user {
+  justify-content: flex-end;
+}
+
+/* ===== bubble ===== */
+.bubble {
+  --bubble-pad-y: 10px;
+  --bubble-pad-x: 12px;
+
+  max-width: 72%;
+  padding: var(--bubble-pad-y) var(--bubble-pad-x);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+
+  white-space: pre-wrap;
+  word-break: break-word;
+
+  font-size: var(--font-size);
+  line-height: 1.5;
+  display: inline-block;
+
+  will-change: transform, opacity;
+}
+
+.bubble.user {
+  background: var(--bubble-user);
+  border-color: var(--accent);
+}
+
+.bubble.assistant {
+  background: var(--bubble-assistant);
+  border-color: var(--border);
+}
+
+.bubble.error {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+}
+
+/* enter animation */
+.bubble.enter.from-right {
+  animation: bubble-in-right 180ms ease-out both;
+}
+
+.bubble.enter.from-left {
+  animation: bubble-in-left 180ms ease-out both;
+}
+
+/* shake animation */
+.bubble.shake {
+  animation: bubble-shake 220ms ease-out;
+}
+
+/* ===== thinking shimmer (scan / sweep) =====
+   - 布局宽度由 bubble 本身 textContent 决定（参与布局）
+   - 真实文字用 color: transparent 隐藏（避免“重影”）
+   - ::before 画底色文字（永远可见）
+   - ::after 画扫光高亮（clip 到文字形状）
+*/
+.bubble.thinking {
+  position: relative;
+  color: transparent; /* 保留布局，但不显示 DOM 里的真实文字 */
+  overflow: hidden;   /* 只裁剪扫光层，不影响宽度 */
+}
+
+/* 公共：复制文字内容 & 对齐（不要在这里做 clip / 透明化底字） */
+.bubble.thinking::before,
+.bubble.thinking::after {
+  content: attr(data-thinking-text);
+  position: absolute;
+  inset: 0;
+  padding: var(--bubble-pad-y) var(--bubble-pad-x);
+  white-space: pre-wrap;
+  word-break: break-word;
+  pointer-events: none;
+}
+
+/* 底色文字：一直可见，提高可读性 */
+.bubble.thinking::before {
+  color: rgba(241, 240, 240, 0.7);
+  z-index: 1;
+}
+
+/* 扫光高亮：只显示在“文字形状”上 */
+.bubble.thinking::after {
+  z-index: 2;
+
+  /* 光束：窄 + 柔和（不是整段亮字） */
+  background: linear-gradient(
+  90deg,
+  transparent 0%,
+  rgba(255, 255, 255, 0.25) 35%,
+  rgba(255, 255, 255, 0.85) 45%,
+  rgba(255, 255, 255, 1) 50%,
+  rgba(255, 255, 255, 0.85) 55%,
+  rgba(255, 255, 255, 0.25) 65%,
+  transparent 100%
+);
+
+  /* 关键：只让光束显示在文字形状上 */
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+
+  filter: blur(0.6px);
+  opacity: 0.95;
+
+  /* 平滑循环：background-position 循环不会“闪断” */
+  background-size: 300% 100%;
+  background-position: 0% 50%;
+  animation: shimmer-sweep var(--thinking-shimmer-speed) linear infinite;
+}
+
+/* dots 显示在最上层 */
+.bubble.thinking .dots {
+  color: var(--muted);
+  position: relative;
+  z-index: 3;
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 4px;
+}
+
+.bubble.thinking .dots span {
+  opacity: 0.2;
+  animation: thinking-dots 1.1s ease-in-out infinite;
+}
+
+.bubble.thinking .dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.bubble.thinking .dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* footer */
+.footer {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: calc(var(--font-size) - 2px);
+}
+
+/* input */
+.input-bar {
+  display: flex;
+  gap: 8px;
+}
+
+#inputArea {
+  flex: 1;
+  background: #1a1a1a;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  resize: none;
+  font-size: var(--font-size);
+  line-height: 1.5;
+  min-height: 42px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+/* modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 99999;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-content {
+  background: #1a1a1a;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  width: 520px;
+  color: var(--text);
+  position: relative; z-index: 100000;
+}
+
+.modal-title {
+  font-size: 16px;
+  margin-bottom: 12px;
+}
+
+.form {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px 12px;
+}
+
+.form input {
+  background: #121212;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* markdown */
+.markdown-body pre {
+  background: #0b0b0b;
+  border: 1px solid #222;
+  padding: 10px;
+  border-radius: 8px;
+  overflow: auto;
+}
+
+.markdown-body code {
+  background: #111;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.markdown-body a {
+  color: #7aa2f7;
+  text-decoration: none;
+}
+
+/* references (details/summary collapsed by default) */
+.refs {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.refs-summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: calc(var(--font-size) - 1px);
+  list-style: none;
+  user-select: none;
+}
+
+.refs-summary:hover {
+  color: #c4c7cc;
+}
+
+.refs-summary::-webkit-details-marker {
+  display: none;
+}
+
+.refs-summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 6px;
+  transform: rotate(0deg);
+  transition: transform 120ms ease-out;
+}
+
+.refs[open] .refs-summary::before {
+  transform: rotate(90deg);
+}
+
+.refs-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.refs-heading a {
+  color: #7aa2f7;
+  text-decoration: none;
+}
+
+.refs-meta {
+  color: var(--muted);
+  font-size: calc(var(--font-size) - 2px);
+}
+
+.refs-preview {
+  color: var(--muted);
+  font-size: calc(var(--font-size) - 2px);
+  margin-top: 2px;
+}
+
+/* ===== animations ===== */
+@keyframes bubble-in-right {
+  from { opacity: 0; transform: translate3d(8px, 6px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes bubble-in-left {
+  from { opacity: 0; transform: translate3d(-8px, 6px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes thinking-dots {
+  0%, 100% { opacity: 0.2; }
+  50%      { opacity: 0.85; }
+}
+
+@keyframes bubble-shake {
+  0%   { transform: translate3d(0, 0, 0); }
+  25%  { transform: translate3d(-4px, 0, 0); }
+  50%  { transform: translate3d(4px, 0, 0); }
+  75%  { transform: translate3d(-3px, 0, 0); }
+  100% { transform: translate3d(0, 0, 0); }
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 0.75; transform: translate3d(0, 0, 0); }
+  50%      { opacity: 1; transform: translate3d(0, -1px, 0); }
+}
+
+/* 扫光循环：0% -> 300%（和 background-size 对齐，视觉无“跳”） */
+@keyframes shimmer-sweep {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 300% 50%; }
+}
+
+/* ===== SAFETY: isolate chat bubble effects from input layout ===== */
+.input-bar,
+#inputArea {
+  position: relative !important;
+  overflow: visible !important;
+  white-space: normal !important;
+  word-break: normal !important;
+}
+
+#inputArea {
+  --bubble-pad-y: initial;
+  --bubble-pad-x: initial;
+}
+
+/* reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+  .bubble.thinking::after {
+    animation: none !important;
+    transform: none !important;
+  }
+}
+/* ===== API KEY NOTICE ===== */
+
+.api-key-notice {
+  margin: 4px 0 8px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #3b2a14;
+  border: 1px solid #5c3f1c;
+  color: #f5d28c;
+  font-size: 13px;
+}
+
+.api-key-link {
+  text-decoration: underline;
+  cursor: pointer;
+  color: #ffd27a;
+}
+
+.api-key-link:hover {
+  color: #fff1c0;
+}
+
+.api-key-notice.hidden {
+  display: none;
+}
