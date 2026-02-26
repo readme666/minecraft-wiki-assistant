@@ -11,7 +11,7 @@ def run_pipeline(
 ) -> Dict[str, Any]:
     t0 = time.time()
 
-    import rag_cli
+    from backend import rag_cli
 
     kwargs: Dict[str, Any] = {
         "progress_cb": progress_cb,

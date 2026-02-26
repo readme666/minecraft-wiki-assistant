@@ -1480,7 +1480,7 @@ STRATEGIES = {
         "k_title_chunks_each": 4,
     },
     "howto": {
-        "use_title_prior": True,
+        "use_title_prior": False,
         "top_k": 26,
         "vec_k": 160,
         "max_per_title": 1,
@@ -1525,7 +1525,7 @@ STRATEGIES = {
         "k_anchor_total": 40,             # 锚点召回最多给40个chunk（上限）
     },
     "why": {
-        "use_title_prior": True,
+        "use_title_prior": False,
         "top_k": 26,
         "vec_k": 200,
         "max_per_title": 1,
@@ -2952,6 +2952,14 @@ def pipeline(
 
     _progress("正在调用 DeepSeek 生成回答…")
     answer = call_llm(messages, config=config)
+    if (config.get("debug_mode")):
+        print ("[DEBUG]Details informations of this answer:\n")
+        print ("[DEBUG]mode:",mode,'\n')
+        print ("[DEBUG]need_version",need_version,'\n')
+        print ("[DEBUG]detail_level",detail_level,'\n')
+        print ("[DEBUG]anchors",qp.get("anchors", []),'\n')
+        print ("[DEBUG]subquestions",subquestions,'\n')
+
     # ---- 7) 返回结构化结果 ----
     return {
         "answer": answer,

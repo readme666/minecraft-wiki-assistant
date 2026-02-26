@@ -152,10 +152,22 @@ def parse_one(xml_path: Path, out_f, *, skip_redirect: bool = True) -> int:
 
             page_idx += 1
 
-            title = elem.findtext(f"{ns}title") or elem.findtext("title")
-            if not title:
+            raw_title = elem.findtext(f"{ns}title") or elem.findtext("title")
+            if not raw_title:
                 elem.clear()
                 continue
+
+            # ==========================================
+            # 💡 新增逻辑：分离“检索用标题”与“URL用原始标题”
+            # ==========================================
+            original_title = raw_title  # 保留原汁原味的标题，用来生成能正常访问的 URL
+            clean_title = raw_title     # 这个用来存入向量库和展示
+
+            if clean_title.startswith("Tutorial:"):
+                clean_title = clean_title[len("Tutorial:"):]
+            elif clean_title.startswith("教程:"):  # 兼容部分已经被本地化的中文前缀
+                clean_title = clean_title[len("教程:"):]
+            # ==========================================
 
             # 可选：跳过重定向页（减少无意义数据）
             if skip_redirect:
@@ -177,8 +189,8 @@ def parse_one(xml_path: Path, out_f, *, skip_redirect: bool = True) -> int:
                 sections = split_sections_from_wikitext(text)
 
                 rec = {
-                    "title": title,
-                    "url": f"https://zh.minecraft.wiki/wiki/{quote(title)}",
+                    "title": clean_title,  # ✅ 检索/展示用：例如 "雪傀儡防线"
+                    "url": f"https://zh.minecraft.wiki/wiki/{quote(original_title)}", # ✅ 跳转用：例如 "Tutorial:雪傀儡防线"
                     "wikitext": text,
                     "sections": sections,
                     # 方便排查与定位

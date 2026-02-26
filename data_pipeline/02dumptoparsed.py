@@ -84,7 +84,7 @@ UA = "local-rag/0.1 (contact: you@example.com)"
 def expand_templates(title: str, text: str, timeout: int = 30, *,
                      retries: int = 4,
                      backoff_base: float = 1.2,
-                     max_text_len: int = 60000) -> str:
+                     max_text_len: int = 120000) -> str:
     """
     调 MediaWiki API expandtemplates，把模板展开。
     - 内存 LRU + 可选磁盘缓存

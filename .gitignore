@@ -50,3 +50,7 @@ Thumbs.db
 *.un~
 # Hugging face cache
 .hf_cache
+
+#Transformer model
+pyserver/models
+
