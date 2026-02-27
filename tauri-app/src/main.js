@@ -71,7 +71,23 @@ function updateNearBottom() {
 }
 
 chatList.addEventListener("scroll", updateNearBottom);
-
+// ====== 修复外部链接点击跳转 ======
+chatList.addEventListener("click", async (e) => {
+  // 寻找到被点击元素最近的 <a> 标签
+  const a = e.target.closest("a");
+  
+  // 如果点的是链接，并且有 href 属性
+  if (a && a.href) {
+    e.preventDefault(); // 阻止 WebView 默认的“在应用内跳转”行为
+    try {
+      // 使用 Tauri 的 shell plugin 调用系统默认浏览器打开外部链接
+      await open(a.href);
+    } catch (err) {
+      console.error("打开链接失败:", err);
+      setStatus("Error: 无法打开链接");
+    }
+  }
+});
 function scrollToBottomIfNeeded() {
   if (nearBottom) {
     chatList.scrollTop = chatList.scrollHeight;
@@ -135,9 +151,62 @@ function applyShakeOnce(bubble) {
   );
 }
 
+const COPY_ICON = `
+<svg viewBox="0 0 24 24" aria-hidden="true">
+  <rect x="9" y="9" width="10" height="10" rx="2" ry="2"></rect>
+  <rect x="5" y="5" width="10" height="10" rx="2" ry="2"></rect>
+</svg>
+`;
+
+const CHECK_ICON = `
+<svg viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M20 6L9 17l-5-5"></path>
+</svg>
+`;
+
+const ERROR_ICON = `
+<svg viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M6 6l12 12M18 6L6 18"></path>
+</svg>
+`;
+
+function getCopyTextFromBubble(bubble) {
+  const clone = bubble.cloneNode(true);
+  clone.querySelectorAll(".refs, .footer, .dots").forEach((node) => node.remove());
+  return clone.textContent.trim();
+}
+
+async function writeTextToClipboard(text) {
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const temp = document.createElement("textarea");
+    temp.value = text;
+    temp.setAttribute("readonly", "true");
+    temp.style.position = "fixed";
+    temp.style.left = "-9999px";
+    document.body.appendChild(temp);
+    temp.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (_) {}
+    temp.remove();
+    return ok;
+  }
+}
+
 function createMessageRow(role, text, status) {
   const row = document.createElement("div");
   row.className = `message-row ${role}`;
+
+  const content = document.createElement("div");
+  content.className = "message-content";
+
+  const bubbleWrap = document.createElement("div");
+  bubbleWrap.className = "bubble-wrap";
 
   const bubble = document.createElement("div");
   bubble.className = `bubble ${role === "user" ? "user" : "assistant"}`;
@@ -157,7 +226,29 @@ function createMessageRow(role, text, status) {
     bubble.appendChild(dots);
   }
 
-  row.appendChild(bubble);
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "copy-btn";
+  copyBtn.innerHTML = COPY_ICON;
+  copyBtn.setAttribute("aria-label", "复制本条消息");
+  copyBtn.title = "复制本条消息";
+  copyBtn.addEventListener("click", async () => {
+    const copied = await writeTextToClipboard(getCopyTextFromBubble(bubble));
+    copyBtn.classList.toggle("copied", copied);
+    copyBtn.classList.toggle("failed", !copied);
+    copyBtn.innerHTML = copied ? CHECK_ICON : ERROR_ICON;
+    copyBtn.title = copied ? "已复制" : "复制失败";
+    setTimeout(() => {
+      copyBtn.classList.remove("copied", "failed");
+      copyBtn.innerHTML = COPY_ICON;
+      copyBtn.title = "复制本条消息";
+    }, 1200);
+  });
+
+  bubbleWrap.appendChild(bubble);
+  bubbleWrap.appendChild(copyBtn);
+  content.appendChild(bubbleWrap);
+  row.appendChild(content);
   chatList.appendChild(row);
 
   // Trigger enter animation after insertion (no DOM rebuild).

@@ -23,6 +23,11 @@
         { "path": "$APPDATA/com.minecraft.wiki.assistant/**" }
       ]
     },
+    "shell:allow-open",
+    {
+      "identifier": "shell:allow-open",
+      "allow": [{ "url": "http://*/*" }, { "url": "https://*/*" }]
+    },
     "opener:default"
   ]
 }

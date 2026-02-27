@@ -54,3 +54,8 @@ Thumbs.db
 #Transformer model
 pyserver/models
 
+#Test Bat File
+test.bat
+
+#Titles
+titles_all.txt

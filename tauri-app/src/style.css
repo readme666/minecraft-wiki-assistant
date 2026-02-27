@@ -123,12 +123,27 @@ body, html {
   justify-content: flex-end;
 }
 
+.message-content {
+  display: flex;
+  width: 100%;
+}
+
+.message-row.user .message-content {
+  justify-content: flex-end;
+}
+
+.bubble-wrap {
+  position: relative;
+  max-width: 72%;
+  padding-bottom: 2px;
+}
+
 /* ===== bubble ===== */
 .bubble {
   --bubble-pad-y: 10px;
   --bubble-pad-x: 12px;
 
-  max-width: 72%;
+  max-width: 100%;
   padding: var(--bubble-pad-y) var(--bubble-pad-x);
   border-radius: 10px;
   border: 1px solid var(--border);
@@ -141,6 +156,60 @@ body, html {
   display: inline-block;
 
   will-change: transform, opacity;
+}
+
+.copy-btn {
+  position: absolute;
+  top: calc(100% - 8px);
+  right: 0;
+  width: 28px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #1f1f1f;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.message-row.user .copy-btn {
+  left: 0;
+  right: auto;
+}
+
+.copy-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bubble-wrap:hover .copy-btn,
+.copy-btn:focus-visible {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  color: var(--text);
+  border-color: #4a4a4a;
+}
+
+.copy-btn.copied {
+  color: #9ce7b3;
+  border-color: #357a4a;
+}
+
+.copy-btn.failed {
+  color: #f0a8a8;
+  border-color: #7f3a3a;
 }
 
 .bubble.user {

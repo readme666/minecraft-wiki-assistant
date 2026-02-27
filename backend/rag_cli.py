@@ -1295,18 +1295,20 @@ def classify_question(question: str, *, config: Dict[str, Any]) -> Dict:
         return {"type": "fact", "version_sensitive": True}
 
     system = (
-        "你是问题分类器，只输出严格JSON，不要任何多余文字。\n"
-        '{"intent":"lookup|guide","version_sensitive":true|false}\n'
-        "intent含义：\n"
-        "- lookup: 机制/规则/数值/声望/折扣/概率/计算等查询\n"
-        "- guide: 明确要求步骤/流程/搭建/刷物品/指令操作流程\n"
-        "规则：\n"
-        "1) 含“怎么提高/降低/增加/恢复”等词 ≠ guide。\n"
-        "2) 若问题是机制解释，必须判为 lookup。\n"
-        "3) intent 只能输出 lookup 或 guide。\n"
-        "4) 只允许输出 JSON，不允许解释文字。\n"
-        "version_sensitive: 是否需要区分Java/基岩（一般涉及机制/物品差异则为true）。\n"
-        "禁止输出除 intent 与 version_sensitive 以外的任何字段。"
+        "你是Minecraft问答系统的意图分类器，只输出严格JSON，不要任何多余文字。\n"
+        '{"intent":"fact|howto|why|overview","version_sensitive":true|false}\n'
+        "intent含义与分类标准：\n"
+        "- fact (事实查询): 具体属性、合成配方、生成条件、数值概率、坐标指令等单点客观事实。例如“钻石剑多少伤害”、“史莱姆区块怎么算”。\n"
+        "- howto (流程指南): 明确要求连贯的建造步骤、红石机器搭建、自动化农场设计或复杂操作流程。例如“怎么做刷铁机”、“村民繁殖机怎么造”。\n"
+        "- why (机制解释与对比): 故障排查、底层机制原理解释、物品或机制之间的对比优劣。例如“为什么铁傀儡不生成”、“附魔金苹果和普通金苹果的区别”、“村庄声望机制是什么”。\n"
+        "- overview (宏观概览): 列表盘点、种类大全、宏观总结。例如“Minecraft有哪些生物群系”、“列出所有红石元件”、“有哪些方法可以获得经验”。\n"
+        "强干扰规则（必须遵守）：\n"
+        "1) 包含“怎么提高/降低/增加/获得”等词的非建造类问题（如怎么提高声望），属于 fact 或 why，绝对 ≠ howto。\n"
+        "2) 只要是问“为什么/区别是什么/原理”，无脑判为 why。\n"
+        "3) 只要是问“大全/所有/哪些/盘点”，无脑判为 overview。\n"
+        "4) intent 只能是 fact, howto, why, overview 中的一个。\n"
+        "version_sensitive: 是否需要区分Java/基岩版（涉及红石、机器、战斗机制、特定生成条件时为true，简单的剧情/背景/普适性方块为false）。\n"
+        "禁止输出除 intent 与 version_sensitive 以外的任何字段或解释说明文字。"
     )
     user = f"问题：{question}"
 
@@ -1319,11 +1321,11 @@ def classify_question(question: str, *, config: Dict[str, Any]) -> Dict:
         return {"type": "fact", "version_sensitive": True}
 
     intent = r.get("intent")
-    if intent not in ("lookup", "guide"):
-        return {"type": "fact", "version_sensitive": True}
+    if intent not in ("fact", "howto", "why", "overview"):
+        return {"type": "fact", "version_sensitive": True} # 默认兜底
 
-    out_type = "howto" if intent == "guide" else "fact"
-    return {"type": out_type, "version_sensitive": bool(r.get("version_sensitive", True))}
+    return {"type": intent, "version_sensitive": bool(r.get("version_sensitive", True))}
+
 # ============================================================
 # Deepseek：抽取“检索锚点”（去噪！）
 # ============================================================
@@ -1481,10 +1483,10 @@ STRATEGIES = {
     },
     "howto": {
         "use_title_prior": False,
-        "top_k": 26,
+        "top_k": 20,                 
         "vec_k": 160,
-        "max_per_title": 1,
-        "k_title_pages": 6,
+        "max_per_title": 10,         
+        "k_title_pages": 6,          
         "k_chunks_per_page": 4,
         "k_title_total": 40,
         "title_page_chunk_cap": 36,
@@ -1495,7 +1497,7 @@ STRATEGIES = {
         "enable_page_rerank": True,
         "enable_global_rerank": True,
         "global_rerank_cap": 160,
-        "global_rerank_use_mmr": False,
+        "global_rerank_use_mmr": False, 
         "global_rerank_score_floor": 0.0,
         "global_prefilter_m": 60,
         "mmr_lambda": 0.75,
@@ -1511,24 +1513,23 @@ STRATEGIES = {
         "page_boost_topn": 5,
         "page_boost_mode": "max",
         "cap_titles_for_prior": False,
-        "rerank_use_title_section": False,
+        "rerank_use_title_section": True,
         "rerank_title_weight": 1.0,
-        "rerank_section_weight": 1.0,
+        "rerank_section_weight": 1.2,
         "rerank_text_weight": 0.5,
         "enable_facet_retrieval": True,
         "min_per_facet": 6,
         "max_facets": 4,
-        # multi
         "k_title_chunks_each": 4,
-        "k_title_pages_each": 2,          # 每个 anchor 最多匹配2个标题（一般 1~2）
-        "k_anchor_chunks_per_page": 2,    # 每个锚点页拿2个chunk就够了（保底+省token）
-        "k_anchor_total": 40,             # 锚点召回最多给40个chunk（上限）
+        "k_title_pages_each": 2,
+        "k_anchor_chunks_per_page": 2,
+        "k_anchor_total": 40,
     },
     "why": {
         "use_title_prior": False,
-        "top_k": 26,
+        "top_k": 22,                  # 🔽 稍微下调一点，给 MMR 精选留出高质量空间
         "vec_k": 200,
-        "max_per_title": 1,
+        "max_per_title": 5,           # 🔼 允许单页面贡献多条机制解释
         "k_title_pages": 6,
         "k_chunks_per_page": 4,
         "k_title_total": 30,
@@ -1540,10 +1541,10 @@ STRATEGIES = {
         "enable_page_rerank": True,
         "enable_global_rerank": True,
         "global_rerank_cap": 160,
-        "global_rerank_use_mmr": False,
+        "global_rerank_use_mmr": True,   # 🔼 关键！开启 MMR，让大模型看到更多维度的原因
         "global_rerank_score_floor": 0.0,
         "global_prefilter_m": 60,
-        "mmr_lambda": 0.75,
+        "mmr_lambda": 0.65,              # 🔼 稍微调低 lambda (比如 0.65)，增加惩罚力度，逼迫多样性
         "mmr_pool_cap": 80,
         "auto_fill_topk": False,
         "extra_vec_per_title": 0,
@@ -1556,25 +1557,24 @@ STRATEGIES = {
         "page_boost_topn": 5,
         "page_boost_mode": "max",
         "cap_titles_for_prior": False,
-        "rerank_use_title_section": False,
+        "rerank_use_title_section": True, # 🔼 让向量模型结合标题打分
         "rerank_title_weight": 1.0,
-        "rerank_section_weight": 1.0,
+        "rerank_section_weight": 1.0,     
         "rerank_text_weight": 0.5,
-        "enable_facet_retrieval": True,
+        "enable_facet_retrieval": True,   # (多切面检索对对比类问题很有用，保持 True)
         "min_per_facet": 6,
         "max_facets": 4,
         # multi
         "k_title_pages_each": 2,
         "k_title_chunks_each": 4,
-        "k_title_pages_each": 2,          # 每个 anchor 最多匹配2个标题（一般 1~2）
-        "k_anchor_chunks_per_page": 2,    # 每个锚点页拿2个chunk就够了（保底+省token）
-        "k_anchor_total": 40,             # 锚点召回最多给40个chunk（上限）
+        "k_anchor_chunks_per_page": 2,
+        "k_anchor_total": 40,
     },
     "overview": {
-        "use_title_prior": False,
-        "top_k": 60,
-        "vec_k": 600,
-        "max_per_title": 1,
+        "use_title_prior": False,        # 保持 False，概览问题不需要硬匹配单一标题
+        "top_k": 40,                     # 🔽 稍微下调。60 个 chunk 喂给大模型上下文太长了，40 足够覆盖全景
+        "vec_k": 600,                    # 保持大底池，方便海选
+        "max_per_title": 4,              # 🔼 允许“总览页/枢纽页”贡献更多的分段摘要
         "k_title_pages": 0,
         "k_chunks_per_page": 0,
         "k_title_total": 0,
@@ -1583,8 +1583,14 @@ STRATEGIES = {
         "title_prefilter_m": 0,
         "title_total_cap": 0,
         "title_rerank_page_cap": 0,
-        "enable_page_rerank": False,
-        "global_rerank_use_mmr": False,
+        "enable_page_rerank": False,     
+        "enable_global_rerank": True,    # 🔼 必须开启全局重排，否则下面的 MMR 不生效
+        "global_rerank_cap": 160,        # 🔼 补上缺失的重排上限
+        "global_rerank_use_mmr": True,   # 🔼 开启 MMR 多样性打散
+        "global_rerank_score_floor": 0.0,
+        "global_prefilter_m": 60,        # 🔼 补上重排前的预过滤参数
+        "mmr_lambda": 0.5,               # 🔼 调低 lambda (从 0.75 降到 0.5)，强力惩罚重复内容，逼出各种不同的概览点
+        "mmr_pool_cap": 80,              
         "auto_fill_topk": False,
         "extra_vec_per_title": 0,
         "extra_prior_per_title": 0,
@@ -1596,7 +1602,7 @@ STRATEGIES = {
         "page_boost_topn": 5,
         "page_boost_mode": "max",
         "cap_titles_for_prior": False,
-        "rerank_use_title_section": False,
+        "rerank_use_title_section": True, # 🔼 配合向量语义，带上层级结构
         "rerank_title_weight": 1.0,
         "rerank_section_weight": 1.0,
         "rerank_text_weight": 0.5,
