@@ -11,6 +11,7 @@ const API_BASE = "http://127.0.0.1:8000";
 const chatList = document.getElementById("chatList");
 const sessionList = document.getElementById("sessionList");
 const newSessionBtn = document.getElementById("newSessionBtn");
+const inputBar = document.querySelector(".input-bar");
 const inputArea = document.getElementById("inputArea");
 const sendBtn = document.getElementById("sendBtn");
 const statusLabel = document.getElementById("statusLabel");
@@ -18,6 +19,7 @@ const settingsBtn = document.getElementById("settingsBtn");
 const appTitle = document.querySelector(".topbar .title");
 const LS_API_KEY = "mw_assistant_api_key";
 const settingsModal = document.getElementById("settingsModal");
+const settingsModalContent = settingsModal?.querySelector(".modal-content");
 const settingsSave = document.getElementById("settingsSave");
 const settingsCancel = document.getElementById("settingsCancel");
 const restartNotice = document.getElementById("restartNotice");
@@ -43,6 +45,90 @@ let sessions = [];
 let draftSession = null;
 let nearBottom = true;
 let lastLoadedSettingsSnapshot = null;
+let settingsModalCloseTimer = null;
+let animatedSessionId = null;
+
+function attachLiquidPointerTracking(element) {
+  if (!element || element.dataset.liquidPointerBound === "1") return;
+  element.dataset.liquidPointerBound = "1";
+  const resetOnLeaveOnly = element.classList.contains("input-bar");
+  let resetTimer = null;
+  element.style.setProperty("--pointer-x", "50%");
+  element.style.setProperty("--pointer-y", "50%");
+  const resetPointerGlow = () => {
+    element.style.setProperty("--pointer-x", "50%");
+    element.style.setProperty("--pointer-y", "50%");
+  };
+  const clearPendingReset = () => {
+    if (resetTimer) {
+      window.clearTimeout(resetTimer);
+      resetTimer = null;
+    }
+  };
+  const scheduleReset = () => {
+    clearPendingReset();
+    const resetDelay =
+      parseInt(getComputedStyle(element).getPropertyValue("--liquid-reset-delay-ms"), 10) || 170;
+    // Match the CSS glow fade-out so the highlight disappears before recentering.
+    resetTimer = window.setTimeout(() => {
+      resetPointerGlow();
+      resetTimer = null;
+    }, resetDelay);
+  };
+  element.addEventListener("pointermove", (event) => {
+    clearPendingReset();
+    element.classList.add("liquid-glow-active");
+    const rect = element.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = ((event.clientX - rect.left) / rect.width) * 100;
+    const y = ((event.clientY - rect.top) / rect.height) * 100;
+    element.style.setProperty("--pointer-x", `${x}%`);
+    element.style.setProperty("--pointer-y", `${y}%`);
+  });
+  element.addEventListener("pointerleave", () => {
+    element.classList.remove("liquid-glow-active");
+    if (resetOnLeaveOnly || !element.matches(":focus-within")) {
+      scheduleReset();
+    }
+  });
+  if (!resetOnLeaveOnly) {
+    element.addEventListener("focusout", () => {
+      window.setTimeout(() => {
+        if (!element.matches(":hover") && !element.matches(":focus-within")) {
+          scheduleReset();
+        }
+      }, 0);
+    });
+  }
+}
+
+function showSettingsModal() {
+  if (!settingsModal) return;
+  if (settingsModalCloseTimer) {
+    clearTimeout(settingsModalCloseTimer);
+    settingsModalCloseTimer = null;
+  }
+  settingsModal.classList.remove("hidden", "closing");
+}
+
+function finishClosingSettingsModal() {
+  settingsModal.classList.remove("closing");
+  settingsModal.classList.add("hidden");
+  settingsModalCloseTimer = null;
+}
+
+function closeSettingsModal() {
+  if (!settingsModal || settingsModal.classList.contains("hidden")) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    finishClosingSettingsModal();
+    return;
+  }
+  if (settingsModalCloseTimer) {
+    clearTimeout(settingsModalCloseTimer);
+  }
+  settingsModal.classList.add("closing");
+  settingsModalCloseTimer = window.setTimeout(finishClosingSettingsModal, 180);
+}
 
 function getSettingsSnapshot() {
   return {
@@ -228,8 +314,12 @@ function renderSessionList() {
   for (const s of sessions) {
     const item = document.createElement("div");
     item.className = "session-item";
+    attachLiquidPointerTracking(item);
     if (s.id === sessionId) {
       item.classList.add("active");
+    }
+    if (s.id === animatedSessionId) {
+      item.classList.add("activating");
     }
 
     const titleBtn = document.createElement("button");
@@ -239,8 +329,10 @@ function renderSessionList() {
     titleBtn.title = s.title || "新会话";
     titleBtn.addEventListener("click", () => {
       if (sessionId === s.id) return;
+      animatedSessionId = s.id;
       sessionId = s.id;
       renderSessionList();
+      animatedSessionId = null;
       renderChatMessages(s.messages || []);
       saveSessions();
       syncAppTitle();
@@ -252,6 +344,7 @@ function renderSessionList() {
     deleteBtn.textContent = "×";
     deleteBtn.title = "删除会话";
     deleteBtn.setAttribute("aria-label", `删除会话：${s.title || "新会话"}`);
+    attachLiquidPointerTracking(deleteBtn);
     deleteBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteSession(s.id);
@@ -358,6 +451,189 @@ function applyEnterAnimation(bubble, role) {
   );
 }
 
+function animateComposerToBubble(text, bubble) {
+  if (!inputBar || !bubble || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    bubble.classList.remove("morph-target");
+    applyEnterAnimation(bubble, "user");
+    return Promise.resolve();
+  }
+
+  const startRect = inputBar.getBoundingClientRect();
+  const endRect = bubble.getBoundingClientRect();
+  if (!startRect.width || !startRect.height || !endRect.width || !endRect.height) {
+    bubble.classList.remove("morph-target");
+    applyEnterAnimation(bubble, "user");
+    return Promise.resolve();
+  }
+
+  const ghost = document.createElement("div");
+  ghost.className = "composer-morph";
+  ghost.textContent = text;
+  Object.assign(ghost.style, {
+    top: `${startRect.top}px`,
+    left: `${startRect.left}px`,
+    width: `${startRect.width}px`,
+    height: `${startRect.height}px`
+  });
+  document.body.appendChild(ghost);
+
+  const midTop = startRect.top + (endRect.top - startRect.top) * 0.42;
+  const midLeft = startRect.left + (endRect.left - startRect.left) * 0.35;
+  const midWidth = startRect.width + (endRect.width - startRect.width) * 0.58;
+  const midHeight = Math.max(endRect.height + 8, startRect.height - 2);
+
+  const animation = ghost.animate(
+    [
+      {
+        top: `${startRect.top}px`,
+        left: `${startRect.left}px`,
+        width: `${startRect.width}px`,
+        height: `${startRect.height}px`,
+        borderRadius: getComputedStyle(inputBar).borderRadius,
+        opacity: 0.98,
+        filter: "blur(0px)"
+      },
+      {
+        top: `${midTop}px`,
+        left: `${midLeft}px`,
+        width: `${midWidth}px`,
+        height: `${midHeight}px`,
+        borderRadius: "36px",
+        opacity: 0.94,
+        filter: "blur(0.2px)",
+        offset: 0.58
+      },
+      {
+        top: `${endRect.top}px`,
+        left: `${endRect.left}px`,
+        width: `${endRect.width}px`,
+        height: `${endRect.height}px`,
+        borderRadius: getComputedStyle(bubble).borderRadius,
+        opacity: 1,
+        filter: "blur(0px)"
+      }
+    ],
+    {
+      duration: 320,
+      easing: "cubic-bezier(0.22, 0.82, 0.2, 1)",
+      fill: "forwards"
+    }
+  );
+
+  return animation.finished
+    .catch(() => {})
+    .finally(() => {
+      ghost.remove();
+      bubble.classList.remove("morph-target");
+      bubble.classList.add("morph-reveal");
+      bubble.addEventListener(
+        "animationend",
+        () => {
+          bubble.classList.remove("morph-reveal");
+        },
+        { once: true }
+      );
+    });
+}
+
+function animateThinkingToFinalBubble(bubble, renderFinal) {
+  if (!bubble || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    renderFinal();
+    return;
+  }
+
+  const first = bubble.getBoundingClientRect();
+  renderFinal();
+  const last = bubble.getBoundingClientRect();
+
+  if (!first.width || !first.height || !last.width || !last.height) {
+    return;
+  }
+
+  const deltaX = first.left - last.left;
+  const deltaY = first.top - last.top;
+  const scaleX = first.width / last.width;
+  const scaleY = first.height / last.height;
+
+  bubble.classList.add("assistant-expanding");
+  const animation = bubble.animate(
+    [
+      {
+        transformOrigin: "top left",
+        transform: `translate3d(${deltaX}px, ${deltaY}px, 0) scale(${scaleX}, ${scaleY})`,
+        opacity: 0.82,
+        filter: "blur(0.4px)"
+      },
+      {
+        transformOrigin: "top left",
+        transform: "translate3d(0, 0, 0) scale(1, 1)",
+        opacity: 1,
+        filter: "blur(0px)"
+      }
+    ],
+    {
+      duration: 280,
+      easing: "cubic-bezier(0.2, 0.8, 0.2, 1)",
+      fill: "both"
+    }
+  );
+
+  animation.finished
+    .catch(() => {})
+    .finally(() => {
+      bubble.classList.remove("assistant-expanding");
+    });
+}
+
+function animateBubbleHeightChange(bubble, fromHeight) {
+  if (!bubble || !fromHeight || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    return;
+  }
+
+  const toHeight = bubble.getBoundingClientRect().height;
+  if (!toHeight || Math.abs(toHeight - fromHeight) < 1) {
+    return;
+  }
+
+  bubble.classList.add("bubble-resizing");
+  bubble.style.height = `${fromHeight}px`;
+  bubble.style.overflow = "hidden";
+
+  requestAnimationFrame(() => {
+    bubble.style.transition = "height 260ms cubic-bezier(0.22, 0.8, 0.22, 1)";
+    bubble.style.height = `${toHeight}px`;
+  });
+
+  window.setTimeout(() => {
+    bubble.classList.remove("bubble-resizing");
+    bubble.style.transition = "";
+    bubble.style.height = "";
+    bubble.style.overflow = "";
+  }, 280);
+}
+
+async function progressivelyRevealAssistantBubble(bubble, finalText) {
+  const targetText = finalText || "(无回答)";
+  const currentText = bubble.textContent || "";
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || currentText === targetText) {
+    bubble.textContent = targetText;
+    scrollToBottomIfNeeded();
+    return;
+  }
+
+  let index = currentText.length;
+  bubble.textContent = currentText;
+
+  while (index < targetText.length) {
+    const remaining = targetText.length - index;
+    const chunkSize = remaining > 160 ? 8 : remaining > 80 ? 6 : remaining > 24 ? 4 : 2;
+    index = Math.min(targetText.length, index + chunkSize);
+    bubble.textContent = targetText.slice(0, index);
+    scrollToBottomIfNeeded();
+    await new Promise((resolve) => window.setTimeout(resolve, 18));
+  }
+}
+
 function applyShakeOnce(bubble) {
   bubble.classList.add("shake");
   bubble.addEventListener(
@@ -428,6 +704,7 @@ function createMessageRow(role, text, status, animate = true) {
 
   const bubble = document.createElement("div");
   bubble.className = `bubble ${role === "user" ? "user" : "assistant"}`;
+  attachLiquidPointerTracking(bubble);
   if (status === "error") {
     bubble.classList.add("error");
   }
@@ -500,6 +777,11 @@ function renderReferences(evidences) {
   const summary = document.createElement("summary");
   summary.className = "refs-summary";
   summary.textContent = `参考 / References (${evidences.length})`;
+  summary.addEventListener("click", () => {
+    const bubble = details.closest(".bubble");
+    if (!bubble) return;
+    details.dataset.prevBubbleHeight = String(bubble.getBoundingClientRect().height);
+  });
   details.appendChild(summary);
 
   const list = document.createElement("ol");
@@ -549,6 +831,21 @@ function renderReferences(evidences) {
   });
 
   details.appendChild(list);
+  details.addEventListener("toggle", () => {
+    const bubble = details.closest(".bubble");
+    const fromHeight = Number(details.dataset.prevBubbleHeight || 0);
+    requestAnimationFrame(() => {
+      animateBubbleHeightChange(bubble, fromHeight);
+      if (details.open) {
+        list.classList.remove("reveal");
+        requestAnimationFrame(() => {
+          list.classList.add("reveal");
+        });
+      } else {
+        list.classList.remove("reveal");
+      }
+    });
+  });
   return details;
 }
 
@@ -577,13 +874,14 @@ function ensureApiKeyOrPrompt() {
 async function sendMessage() {
   if (!getApiKey()) {
     setStatus("请先在设置中填写 API Key");
-    settingsModal.classList.remove("hidden");
+    showSettingsModal();
     setTimeout(() => cfgApiKey?.focus?.(), 50);
     return;
   }
   const text = inputArea.value.trim();
   if (!text) return;
 
+  const outgoingText = text;
   inputArea.value = "";
   autoResizeInput();
   updateNearBottom();
@@ -629,8 +927,14 @@ async function sendMessage() {
   renderSessionList();
   syncAppTitle();
 
-  createMessageRow("user", text, "normal");
-  const assistantMsg = createMessageRow("assistant", "正在思考", "thinking");
+  const userMsg = createMessageRow("user", text, "normal", false);
+  userMsg.bubble.classList.add("morph-target");
+  const assistantMsg = createMessageRow("assistant", "正在思考", "thinking", false);
+  assistantMsg.bubble.classList.add("pending-reveal");
+  animateComposerToBubble(outgoingText, userMsg.bubble).finally(() => {
+    assistantMsg.bubble.classList.remove("pending-reveal");
+    applyEnterAnimation(assistantMsg.bubble, "assistant");
+  });
 
   setStatus("Running");
   sendBtn.disabled = true;
@@ -703,8 +1007,15 @@ async function sendMessage() {
         saveSessions();
 
         if (sessionId === requestSessionId) {
-          removeThinking(assistantMsg.bubble);
-          renderAssistantFinalBubble(assistantMsg.bubble, assistantMessage);
+          const streamedText = assistantMsg.bubble.dataset.thinkingText || "";
+          animateThinkingToFinalBubble(assistantMsg.bubble, () => {
+            removeThinking(assistantMsg.bubble);
+            assistantMsg.bubble.textContent = streamedText;
+          });
+          progressivelyRevealAssistantBubble(assistantMsg.bubble, assistantMessage.text)
+            .then(() => {
+              renderAssistantFinalBubble(assistantMsg.bubble, assistantMessage);
+            });
         }
 
         finished = true;
@@ -792,12 +1103,42 @@ inputArea.addEventListener("keydown", (ev) => {
 
 function autoResizeInput() {
   inputArea.style.height = "auto";
-  const lineHeight = parseFloat(getComputedStyle(inputArea).lineHeight);
+  const styles = getComputedStyle(inputArea);
+  const lineHeight = parseFloat(styles.lineHeight);
   const maxHeight = lineHeight * 6 + 16;
   inputArea.style.height = Math.min(inputArea.scrollHeight, maxHeight) + "px";
+  updateInputBarLayout(lineHeight);
 }
 
 inputArea.addEventListener("input", autoResizeInput);
+inputArea.addEventListener("focus", () => updateInputBarLayout());
+inputArea.addEventListener("blur", () => updateInputBarLayout());
+
+function updateInputBarLayout(lineHeight = null) {
+  if (!inputBar || !inputArea) return;
+  const resolvedLineHeight =
+    lineHeight ?? parseFloat(getComputedStyle(inputArea).lineHeight);
+  const lines = Math.max(1, Math.round(inputArea.scrollHeight / resolvedLineHeight));
+  const contentLength = inputArea.value.trim().length;
+  const hasContent = contentLength > 0;
+  const isFocused = document.activeElement === inputArea;
+  const viewportWidth = window.innerWidth || 1280;
+  const maxWidth = Math.min(860, Math.max(520, viewportWidth - 72));
+  const minWidth = viewportWidth < 720 ? viewportWidth - 32 : 440;
+  const targetWidth = Math.min(
+    maxWidth,
+    Math.max(
+      minWidth,
+      430 +
+        Math.min(contentLength, 160) * 1.35 +
+        Math.min(lines - 1, 5) * 54 +
+        (isFocused ? 44 : 0)
+    )
+  );
+
+  inputBar.style.setProperty("--composer-width", `${targetWidth}px`);
+  inputBar.classList.toggle("expanded", hasContent || isFocused || lines > 1);
+}
 
 async function openSettings() {
   try {
@@ -816,7 +1157,7 @@ async function openSettings() {
     cfgFontSize.value = cfg.font_size ?? 14;
     lastLoadedSettingsSnapshot = getSettingsSnapshot();
 
-    settingsModal.classList.remove("hidden");
+    showSettingsModal();
   } catch (err) {
     setStatus("Error");
   }
@@ -824,7 +1165,17 @@ async function openSettings() {
 settingsBtn.addEventListener("click", openSettings);
 
 settingsCancel.addEventListener("click", () => {
-  settingsModal.classList.add("hidden");
+  closeSettingsModal();
+});
+
+settingsModal?.addEventListener("click", (event) => {
+  if (event.target === settingsModal) {
+    closeSettingsModal();
+  }
+});
+
+settingsModalContent?.addEventListener("click", (event) => {
+  event.stopPropagation();
 });
 
 settingsSave.addEventListener("click", async () => {
@@ -862,7 +1213,7 @@ settingsSave.addEventListener("click", async () => {
 
     document.documentElement.style.setProperty("--font-size", `${updated.font_size}px`);
     lastLoadedSettingsSnapshot = nextSnapshot;
-    settingsModal.classList.add("hidden");
+    closeSettingsModal();
     setRestartNoticeVisible(settingsChanged);
     setStatus(settingsChanged ? "设置已保存，重启后生效" : "Ready");
   } catch (err) {
@@ -885,7 +1236,10 @@ newSessionBtn?.addEventListener("click", () => {
   renderSessionList();
   renderChatMessages([]);
   syncAppTitle();
+  autoResizeInput();
 });
+
+window.addEventListener("resize", () => updateInputBarLayout());
 
 document.documentElement.style.setProperty("--font-size", "14px");
 async function waitBackendReady() {
@@ -906,11 +1260,17 @@ async function waitBackendReady() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".sidebar, .main").forEach(attachLiquidPointerTracking);
+  document.querySelectorAll(".btn, .input-bar").forEach(attachLiquidPointerTracking);
+  document
+    .querySelectorAll(".modal-content, .form input, .form select")
+    .forEach(attachLiquidPointerTracking);
   loadSessions();
   renderSessionList();
   const current = getCurrentSession();
   renderChatMessages(current?.messages || []);
   syncAppTitle();
+  autoResizeInput();
 
   waitBackendReady();
   updateApiKeyNotice();   // ✅ 只显示提示，不弹窗
