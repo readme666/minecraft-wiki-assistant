@@ -27,6 +27,11 @@ impl Drop for BackendGuard {
 
 struct BackendState(Mutex<BackendGuard>);
 
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 fn read_debug_mode(data_dir: &PathBuf) -> bool {
     // 读取：{app_data_dir}/config.json 里的 debug_mode
     // 任何异常都默认 false（发布更稳）
@@ -107,6 +112,7 @@ fn stop_backend(child: &mut Child) {
 fn main() {
     tauri::Builder::default()
         .manage(BackendState(Mutex::new(BackendGuard { child: None })))
+        .invoke_handler(tauri::generate_handler![restart_app])
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
 

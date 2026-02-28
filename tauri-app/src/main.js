@@ -1,5 +1,6 @@
 ﻿import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { appDataDir } from "@tauri-apps/api/path";
@@ -8,14 +9,21 @@ const openLogDirBtn = document.getElementById("openLogDirBtn");
 const API_BASE = "http://127.0.0.1:8000";
 
 const chatList = document.getElementById("chatList");
+const sessionList = document.getElementById("sessionList");
+const newSessionBtn = document.getElementById("newSessionBtn");
 const inputArea = document.getElementById("inputArea");
 const sendBtn = document.getElementById("sendBtn");
 const statusLabel = document.getElementById("statusLabel");
 const settingsBtn = document.getElementById("settingsBtn");
+const appTitle = document.querySelector(".topbar .title");
 const LS_API_KEY = "mw_assistant_api_key";
 const settingsModal = document.getElementById("settingsModal");
 const settingsSave = document.getElementById("settingsSave");
 const settingsCancel = document.getElementById("settingsCancel");
+const restartNotice = document.getElementById("restartNotice");
+const restartAppBtn = document.getElementById("restartAppBtn");
+const LS_CHAT_HISTORY = "mw_assistant_chat_history_v1";
+const LS_ACTIVE_SESSION = "mw_assistant_active_session_v1";
 
 const apiKeyNotice = document.getElementById("apiKeyNotice");
 const apiKeyNoticeLink = document.getElementById("apiKeyNoticeLink");
@@ -28,9 +36,39 @@ const cfgInputHit = document.getElementById("cfgInputHit");
 const cfgInputMiss = document.getElementById("cfgInputMiss");
 const cfgOutput = document.getElementById("cfgOutput");
 const cfgFontSize = document.getElementById("cfgFontSize");
+const MODEL_OPTIONS = ["deepseek-chat", "deepseek-reasoner"];
 
 let sessionId = "default";
+let sessions = [];
+let draftSession = null;
 let nearBottom = true;
+let lastLoadedSettingsSnapshot = null;
+
+function getSettingsSnapshot() {
+  return {
+    apiKey: cfgApiKey.value.trim(),
+    apiBase: cfgApiBase.value.trim(),
+    model: cfgModel.value.trim(),
+    cacheHitRate: Number(cfgCacheHit.value),
+    inputHitPerMillion: Number(cfgInputHit.value),
+    inputMissPerMillion: Number(cfgInputMiss.value),
+    outputPerMillion: Number(cfgOutput.value),
+    fontSize: Number(cfgFontSize.value),
+    debugMode: !!cfgDebugMode.checked
+  };
+}
+
+function hasSettingsChanged(nextSnapshot) {
+  return JSON.stringify(lastLoadedSettingsSnapshot) !== JSON.stringify(nextSnapshot);
+}
+
+function setRestartNoticeVisible(visible) {
+  restartNotice?.classList.toggle("hidden", !visible);
+}
+
+function normalizeModel(model) {
+  return MODEL_OPTIONS.includes(model) ? model : MODEL_OPTIONS[0];
+}
 
 marked.use({
   renderer: {
@@ -44,6 +82,186 @@ marked.setOptions({
 });
 
 const SAFE_URI = /^(https?:|mailto:)/i;
+const MAX_SESSION_TITLE = 20;
+const DEFAULT_APP_TITLE = "Minecraft Wiki 助手";
+
+function shortText(text, maxLen = MAX_SESSION_TITLE) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "新会话";
+  return t.length > maxLen ? `${t.slice(0, maxLen)}...` : t;
+}
+
+function createSession(initialTitle = "新会话") {
+  const now = Date.now();
+  return {
+    id: `s_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    title: initialTitle,
+    createdAt: now,
+    updatedAt: now,
+    messages: []
+  };
+}
+
+function saveSessions() {
+  try {
+    localStorage.setItem(LS_CHAT_HISTORY, JSON.stringify(sessions));
+    const hasActiveSavedSession = sessions.some((s) => s.id === sessionId);
+    if (hasActiveSavedSession) {
+      localStorage.setItem(LS_ACTIVE_SESSION, sessionId);
+    } else {
+      localStorage.removeItem(LS_ACTIVE_SESSION);
+    }
+  } catch (_) {}
+}
+
+function startDraftSession() {
+  draftSession = createSession("新会话");
+  sessionId = draftSession.id;
+}
+
+function loadSessions() {
+  try {
+    const raw = localStorage.getItem(LS_CHAT_HISTORY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    sessions = Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    sessions = [];
+  }
+  startDraftSession();
+}
+
+function getCurrentSession() {
+  return draftSession?.id === sessionId
+    ? draftSession
+    : sessions.find((s) => s.id === sessionId) || null;
+}
+
+function getCurrentSessionTitle() {
+  const current = getCurrentSession();
+  if (!current) {
+    return DEFAULT_APP_TITLE;
+  }
+
+  const hasMessages = Array.isArray(current.messages) && current.messages.length > 0;
+  const title = (current.title || "").trim();
+  if (!hasMessages || !title || title === "新会话") {
+    return DEFAULT_APP_TITLE;
+  }
+
+  return title;
+}
+
+function syncAppTitle() {
+  const nextTitle = getCurrentSessionTitle();
+  document.title = nextTitle;
+  if (appTitle) {
+    appTitle.textContent = nextTitle;
+  }
+}
+
+function deleteSession(sessionToDeleteId) {
+  const idx = sessions.findIndex((s) => s.id === sessionToDeleteId);
+  if (idx === -1) {
+    return;
+  }
+
+  const deletingActive = sessionId === sessionToDeleteId;
+  sessions.splice(idx, 1);
+
+  if (sessions.length === 0) {
+    startDraftSession();
+  } else if (deletingActive) {
+    const fallback = sessions[idx] || sessions[idx - 1] || sessions[0];
+    sessionId = fallback.id;
+    draftSession = null;
+  }
+
+  saveSessions();
+  renderSessionList();
+  const current = getCurrentSession();
+  renderChatMessages(current?.messages || []);
+  syncAppTitle();
+}
+
+function renderAssistantFinalBubble(bubble, msg) {
+  const html = marked.parse(msg.text || "(无回答)");
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_URI_REGEXP: SAFE_URI,
+    FORBID_ATTR: [/^on/i, "style"]
+  });
+  bubble.innerHTML = clean;
+  bubble.classList.add("markdown-body");
+
+  const refs = renderReferences(msg.evidences_for_llm || []);
+  if (refs) {
+    bubble.appendChild(refs);
+  }
+
+  if (msg.token_usage || msg.timing_ms) {
+    const footer = document.createElement("div");
+    footer.className = "footer";
+    const timing = msg.timing_ms || {};
+    const token = msg.token_usage || {};
+    footer.textContent =
+      `耗时 ${timing.total || 0}ms | ` +
+      `prompt ${Number(token.prompt_tokens || 0).toFixed(2)} tok | ` +
+      `completion ${Number(token.completion_tokens || 0).toFixed(2)} tok | ` +
+      `期望成本 ¥${Number(token.total_expected || 0).toFixed(6)}`;
+    bubble.appendChild(footer);
+  }
+}
+
+function renderChatMessages(messages = []) {
+  chatList.innerHTML = "";
+  for (const msg of messages) {
+    const row = createMessageRow(msg.role, msg.text || "", msg.status || "normal", false);
+    if (msg.role === "assistant" && msg.status === "normal") {
+      renderAssistantFinalBubble(row.bubble, msg);
+    }
+  }
+  nearBottom = true;
+  scrollToBottomIfNeeded();
+}
+
+function renderSessionList() {
+  sessionList.innerHTML = "";
+  for (const s of sessions) {
+    const item = document.createElement("div");
+    item.className = "session-item";
+    if (s.id === sessionId) {
+      item.classList.add("active");
+    }
+
+    const titleBtn = document.createElement("button");
+    titleBtn.type = "button";
+    titleBtn.className = "session-title";
+    titleBtn.textContent = s.title || "新会话";
+    titleBtn.title = s.title || "新会话";
+    titleBtn.addEventListener("click", () => {
+      if (sessionId === s.id) return;
+      sessionId = s.id;
+      renderSessionList();
+      renderChatMessages(s.messages || []);
+      saveSessions();
+      syncAppTitle();
+    });
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "session-delete";
+    deleteBtn.textContent = "×";
+    deleteBtn.title = "删除会话";
+    deleteBtn.setAttribute("aria-label", `删除会话：${s.title || "新会话"}`);
+    deleteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteSession(s.id);
+    });
+
+    item.appendChild(titleBtn);
+    item.appendChild(deleteBtn);
+    sessionList.appendChild(item);
+  }
+}
 
 function setStatus(text) {
   statusLabel.textContent = text;
@@ -198,7 +416,7 @@ async function writeTextToClipboard(text) {
   }
 }
 
-function createMessageRow(role, text, status) {
+function createMessageRow(role, text, status, animate = true) {
   const row = document.createElement("div");
   row.className = `message-row ${role}`;
 
@@ -251,8 +469,10 @@ function createMessageRow(role, text, status) {
   row.appendChild(content);
   chatList.appendChild(row);
 
-  // Trigger enter animation after insertion (no DOM rebuild).
-  applyEnterAnimation(bubble, role);
+  if (animate) {
+    // Trigger enter animation after insertion (no DOM rebuild).
+    applyEnterAnimation(bubble, role);
+  }
 
   scrollToBottomIfNeeded();
 
@@ -356,19 +576,58 @@ function ensureApiKeyOrPrompt() {
 }
 async function sendMessage() {
   if (!getApiKey()) {
-  setStatus("请先在设置中填写 API Key");
-  settingsModal.classList.remove("hidden");
-  setTimeout(() => cfgApiKey?.focus?.(), 50);
-  return;
-}
+    setStatus("请先在设置中填写 API Key");
+    settingsModal.classList.remove("hidden");
+    setTimeout(() => cfgApiKey?.focus?.(), 50);
+    return;
+  }
   const text = inputArea.value.trim();
   if (!text) return;
-  
-
 
   inputArea.value = "";
   autoResizeInput();
   updateNearBottom();
+
+  const activeSession = getCurrentSession();
+  if (!activeSession) {
+    setStatus("Error");
+    return;
+  }
+
+  const isDraftSession = draftSession?.id === activeSession.id;
+  if (isDraftSession) {
+    draftSession = null;
+    sessions.unshift(activeSession);
+  }
+
+  if (!activeSession.messages || activeSession.messages.length === 0 || activeSession.title === "新会话") {
+    activeSession.title = shortText(text);
+  }
+
+  const now = Date.now();
+  const userMsgId = `m_u_${now}`;
+  const assistantMsgId = `m_a_${now}`;
+
+  const userMessage = {
+    id: userMsgId,
+    role: "user",
+    text,
+    status: "normal",
+    createdAt: now
+  };
+  const assistantMessage = {
+    id: assistantMsgId,
+    role: "assistant",
+    text: "正在思考",
+    status: "thinking",
+    createdAt: now + 1
+  };
+
+  activeSession.messages.push(userMessage, assistantMessage);
+  activeSession.updatedAt = Date.now();
+  saveSessions();
+  renderSessionList();
+  syncAppTitle();
 
   createMessageRow("user", text, "normal");
   const assistantMsg = createMessageRow("assistant", "正在思考", "thinking");
@@ -389,18 +648,22 @@ async function sendMessage() {
     assistantMsg.bubble.textContent = `发生错误：${err.message}`;
     assistantMsg.bubble.classList.add("error");
     applyShakeOnce(assistantMsg.bubble);
+    assistantMessage.status = "error";
+    assistantMessage.text = `发生错误：${err.message}`;
+    activeSession.updatedAt = Date.now();
+    saveSessions();
     setStatus("Error");
     sendBtn.disabled = false;
     inputArea.disabled = false;
     return;
   }
   const { message_id } = res;
+  const requestSessionId = sessionId;
   const streamUrl = `${API_BASE}/api/stream?session_id=${encodeURIComponent(sessionId)}&message_id=${encodeURIComponent(message_id)}`;
 
   let finished = false;
   let retried = false;
   let es = null;
-  let clearedThinking = false; // Avoid repeated DOM removal to prevent flicker.
 
   const startStream = () => {
     es = new EventSource(streamUrl);
@@ -409,6 +672,13 @@ async function sendMessage() {
       try {
         const data = JSON.parse(ev.data);
         const nextText = data.text ?? "";
+        assistantMessage.text = nextText || assistantMessage.text;
+        activeSession.updatedAt = Date.now();
+        saveSessions();
+
+        if (sessionId !== requestSessionId) {
+          return;
+        }
         if (assistantMsg.bubble.classList.contains("thinking")) {
           if (nextText.trim() !== "") {
             assistantMsg.bubble.dataset.thinkingText = nextText;
@@ -424,32 +694,17 @@ async function sendMessage() {
     es.addEventListener("final", (ev) => {
       try {
         const data = JSON.parse(ev.data);
-        removeThinking(assistantMsg.bubble);
-        clearedThinking = true;
-        const html = marked.parse(data.answer || "(无回答)");
-        const clean = DOMPurify.sanitize(html, {
-          ALLOWED_URI_REGEXP: SAFE_URI,
-          FORBID_ATTR: [/^on/i, "style"]
-        });
-        assistantMsg.bubble.innerHTML = clean;
-        assistantMsg.bubble.classList.add("markdown-body");
+        assistantMessage.status = "normal";
+        assistantMessage.text = data.answer || "(无回答)";
+        assistantMessage.evidences_for_llm = data.evidences_for_llm || [];
+        assistantMessage.token_usage = data.token_usage || {};
+        assistantMessage.timing_ms = data.timing_ms || {};
+        activeSession.updatedAt = Date.now();
+        saveSessions();
 
-        const refs = renderReferences(data.evidences_for_llm || []);
-        if (refs) {
-          assistantMsg.bubble.appendChild(refs);
-        }
-
-        if (data.token_usage || data.timing_ms) {
-          const footer = document.createElement("div");
-          footer.className = "footer";
-          const timing = data.timing_ms || {};
-          const token = data.token_usage || {};
-          footer.textContent =
-            `耗时 ${timing.total || 0}ms | ` +
-            `prompt ${Number(token.prompt_tokens || 0).toFixed(2)} tok | ` +
-            `completion ${Number(token.completion_tokens || 0).toFixed(2)} tok | ` +
-            `期望成本 ¥${Number(token.total_expected || 0).toFixed(6)}`;
-          assistantMsg.bubble.appendChild(footer);
+        if (sessionId === requestSessionId) {
+          removeThinking(assistantMsg.bubble);
+          renderAssistantFinalBubble(assistantMsg.bubble, assistantMessage);
         }
 
         finished = true;
@@ -462,13 +717,20 @@ async function sendMessage() {
         scrollToBottomIfNeeded();
       } catch (_) {}
     });
-        es.addEventListener("backend_error", (ev) => {
+    es.addEventListener("backend_error", (ev) => {
       try {
         const data = JSON.parse(ev.data || "{}");
-        removeThinking(assistantMsg.bubble);
-        assistantMsg.bubble.textContent = `发生错误：${data.error || "未知错误"}`;
-        assistantMsg.bubble.classList.add("error");
-        applyShakeOnce(assistantMsg.bubble);
+        assistantMessage.status = "error";
+        assistantMessage.text = `发生错误：${data.error || "未知错误"}`;
+        activeSession.updatedAt = Date.now();
+        saveSessions();
+
+        if (sessionId === requestSessionId) {
+          removeThinking(assistantMsg.bubble);
+          assistantMsg.bubble.textContent = `发生错误：${data.error || "未知错误"}`;
+          assistantMsg.bubble.classList.add("error");
+          applyShakeOnce(assistantMsg.bubble);
+        }
 
         finished = true;
         if (es) es.close();
@@ -490,10 +752,13 @@ async function sendMessage() {
         return;
       }
       removeThinking(assistantMsg.bubble);
-      clearedThinking = true;
       assistantMsg.bubble.textContent = "发生错误：后端流中断";
       assistantMsg.bubble.classList.add("error");
       applyShakeOnce(assistantMsg.bubble);
+      assistantMessage.status = "error";
+      assistantMessage.text = "发生错误：后端流中断";
+      activeSession.updatedAt = Date.now();
+      saveSessions();
       setStatus("Error");
       sendBtn.disabled = false;
       inputArea.disabled = false;
@@ -543,12 +808,13 @@ async function openSettings() {
     cfgApiKey.value = savedKey;
     cfgDebugMode.checked = !!cfg.debug_mode;
     cfgApiBase.value = cfg.api_base || "";
-    cfgModel.value = cfg.model || "";
+    cfgModel.value = normalizeModel(cfg.model || "");
     cfgCacheHit.value = cfg.cache_hit_rate ?? 0.07;
     cfgInputHit.value = cfg.input_hit_per_million ?? 0.2;
     cfgInputMiss.value = cfg.input_miss_per_million ?? 2.0;
     cfgOutput.value = cfg.output_per_million ?? 3.0;
     cfgFontSize.value = cfg.font_size ?? 14;
+    lastLoadedSettingsSnapshot = getSettingsSnapshot();
 
     settingsModal.classList.remove("hidden");
   } catch (err) {
@@ -571,7 +837,7 @@ settingsSave.addEventListener("click", async () => {
   // ✅ 2) 其余配置照旧发给后端
   const updated = {
     api_base: cfgApiBase.value.trim(),
-    model: cfgModel.value.trim(),
+    model: normalizeModel(cfgModel.value.trim()),
     cache_hit_rate: Number(cfgCacheHit.value),
     input_hit_per_million: Number(cfgInputHit.value),
     input_miss_per_million: Number(cfgInputMiss.value),
@@ -579,6 +845,8 @@ settingsSave.addEventListener("click", async () => {
     font_size: Number(cfgFontSize.value),
     debug_mode: !!cfgDebugMode.checked,
   };
+  const nextSnapshot = getSettingsSnapshot();
+  const settingsChanged = hasSettingsChanged(nextSnapshot);
 
   try {
     await fetchJsonWithRetry(
@@ -593,11 +861,30 @@ settingsSave.addEventListener("click", async () => {
     );
 
     document.documentElement.style.setProperty("--font-size", `${updated.font_size}px`);
+    lastLoadedSettingsSnapshot = nextSnapshot;
     settingsModal.classList.add("hidden");
-    setStatus("Ready");
+    setRestartNoticeVisible(settingsChanged);
+    setStatus(settingsChanged ? "设置已保存，重启后生效" : "Ready");
   } catch (err) {
     setStatus("Error");
   }
+});
+
+restartAppBtn?.addEventListener("click", async () => {
+  restartAppBtn.disabled = true;
+  try {
+    await invoke("restart_app");
+  } catch (_) {
+    restartAppBtn.disabled = false;
+    setStatus("Error: 重启失败");
+  }
+});
+
+newSessionBtn?.addEventListener("click", () => {
+  startDraftSession();
+  renderSessionList();
+  renderChatMessages([]);
+  syncAppTitle();
 });
 
 document.documentElement.style.setProperty("--font-size", "14px");
@@ -619,6 +906,12 @@ async function waitBackendReady() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  loadSessions();
+  renderSessionList();
+  const current = getCurrentSession();
+  renderChatMessages(current?.messages || []);
+  syncAppTitle();
+
   waitBackendReady();
   updateApiKeyNotice();   // ✅ 只显示提示，不弹窗
 });

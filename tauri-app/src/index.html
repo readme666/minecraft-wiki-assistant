@@ -9,8 +9,11 @@
   <body>
     <div class="app">
       <aside class="sidebar">
-        <div class="session-header">会话</div>
-        <div class="session-item active">默认会话</div>
+        <div class="session-header">
+          <span>会话</span>
+          <button id="newSessionBtn" class="btn small">新建</button>
+        </div>
+        <div id="sessionList"></div>
       </aside>
 
       <main class="main">
@@ -19,6 +22,10 @@
           <div class="status" id="statusLabel">Ready</div>
           <button id="settingsBtn" class="btn">设置</button>
         </header>
+        <div id="restartNotice" class="restart-notice hidden">
+          <span>设置已保存，重启应用后生效。</span>
+          <button id="restartAppBtn" class="btn small">立即重启</button>
+        </div>
         <div id="apiKeyNotice" class="api-key-notice hidden">
           ⚠ 尚未设置 API Key，
           <span id="apiKeyNoticeLink" class="api-key-link">点击这里前往设置</span>
@@ -43,7 +50,10 @@
           <input type="text" id="cfgApiBase" />
 
           <label>Model</label>
-          <input type="text" id="cfgModel" />
+          <select id="cfgModel">
+            <option value="deepseek-chat">deepseek-chat</option>
+            <option value="deepseek-reasoner">deepseek-reasoner</option>
+          </select>
 
           <label>缓存命中率</label>
           <input type="number" step="0.01" id="cfgCacheHit" />

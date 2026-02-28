@@ -38,23 +38,88 @@ body, html {
   background: var(--panel);
   border-right: 1px solid var(--border);
   padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .session-header {
   font-size: 12px;
   color: var(--muted);
-  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .session-item {
-  padding: 10px 12px;
+  width: 100%;
   border-radius: 8px;
   color: var(--text);
   background: transparent;
+  border: 1px solid transparent;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .session-item.active {
   background: #1b1b1b;
+  border-color: var(--border);
+}
+
+.session-item:hover {
+  background: #171717;
+}
+
+.session-title {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 6px 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-delete {
+  width: 28px;
+  height: 28px;
+  margin-right: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease-out, background-color 120ms ease-out, color 120ms ease-out;
+}
+
+.session-item:hover .session-delete,
+.session-item:focus-within .session-delete {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.session-delete:hover {
+  background: #2a1b1b;
+  color: #f0a8a8;
+}
+
+#sessionList {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
 }
 
 .main {
@@ -160,7 +225,7 @@ body, html {
 
 .copy-btn {
   position: absolute;
-  top: calc(100% - 8px);
+  top: calc(100%);
   right: 0;
   width: 28px;
   height: 20px;
@@ -389,7 +454,8 @@ body, html {
   gap: 10px 12px;
 }
 
-.form input {
+.form input,
+.form select {
   background: #121212;
   color: var(--text);
   border: 1px solid var(--border);
@@ -563,5 +629,23 @@ body, html {
 }
 
 .api-key-notice.hidden {
+  display: none;
+}
+
+.restart-notice {
+  margin: 4px 0 8px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #1f2f21;
+  border: 1px solid #35563a;
+  color: #b9e6bf;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.restart-notice.hidden {
   display: none;
 }
