@@ -3,8 +3,17 @@ import random
 import re
 import requests
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import time
+from urllib.parse import unquote, urlparse
+try:
+    from bs4 import BeautifulSoup, NavigableString, Tag
+    _HAS_BS4 = True
+except Exception:
+    BeautifulSoup = None
+    NavigableString = str
+    Tag = object
+    _HAS_BS4 = False
 try:
     import mwparserfromhell  # type: ignore
     _HAS_MW = True
@@ -22,6 +31,9 @@ OUT_FILE = DATA_DIR / "data_parsed.jsonl"
 EXPAND_CACHE_FILE = Path("expand_cache.jsonl")   # 可选：不想落盘就注释掉相关写入/读取
 EXPAND_CACHE_MAX = 5000                          # 内存最多缓存条目数（可调）
 _expand_cache: OrderedDict[str, str] = OrderedDict()
+PARSE_CACHE_FILE = Path("parse_cache.jsonl")
+PARSE_CACHE_MAX = 2000
+_parse_cache: OrderedDict[str, Dict] = OrderedDict()
 
 # 内存 LRU cache
 _expand_cache_mem: OrderedDict[str, str] = OrderedDict()
@@ -68,8 +80,47 @@ def _expand_cache_append(k: str, v: str) -> None:
     except Exception:
         pass
 
+
+def _parse_cache_get(k: str) -> Optional[Dict]:
+    v = _parse_cache.get(k)
+    if v is None:
+        return None
+    _parse_cache.move_to_end(k)
+    return v
+
+
+def _parse_cache_put(k: str, v: Dict) -> None:
+    _parse_cache[k] = v
+    _parse_cache.move_to_end(k)
+    if len(_parse_cache) > PARSE_CACHE_MAX:
+        _parse_cache.popitem(last=False)
+
+
+def _parse_cache_load() -> None:
+    if not PARSE_CACHE_FILE.exists():
+        return
+    try:
+        with PARSE_CACHE_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line)
+                k = obj.get("k")
+                v = obj.get("v")
+                if isinstance(k, str) and isinstance(v, dict):
+                    _parse_cache_put(k, v)
+    except Exception:
+        pass
+
+
+def _parse_cache_append(k: str, v: Dict) -> None:
+    try:
+        with PARSE_CACHE_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": k, "v": v}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 # 程序启动时加载一次（想禁用磁盘缓存就把这一行注释掉）
 _expand_cache_load()
+_parse_cache_load()
 
 SESSION = requests.Session()
 
@@ -79,6 +130,23 @@ from functools import lru_cache
 WIKI_API = "https://zh.minecraft.wiki/api.php"
 API_URL = "https://zh.minecraft.wiki/api.php"
 UA = "local-rag/0.1 (contact: you@example.com)"
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept": "application/json",
+})
+
+
+def _resolve_api_title(obj: Dict) -> str:
+    url = (obj.get("url") or "").strip()
+    if url:
+        try:
+            parsed = urlparse(url)
+            marker = "/wiki/"
+            if marker in parsed.path:
+                return unquote(parsed.path.split(marker, 1)[1])
+        except Exception:
+            pass
+    return (obj.get("title") or "").strip()
 
 
 def expand_templates(title: str, text: str, timeout: int = 30, *,
@@ -162,6 +230,309 @@ def expand_templates(title: str, text: str, timeout: int = 30, *,
     _expand_cache_put(k, text)
     # _expand_cache_append(k, text)  # 可选
     return text
+
+
+_SKIP_TABLE_CLASSES = {
+    "navbox",
+    "vertical-navbox",
+    "metadata",
+    "plainlinks",
+    "ambox",
+    "ombox",
+    "tmbox",
+    "toc",
+}
+
+_SKIP_BLOCK_CLASSES = {
+    "mw-editsection",
+    "reference",
+    "reflist",
+    "navbox",
+    "toc",
+    "thumb",
+    "tright",
+    "tleft",
+    "floatright",
+    "floatleft",
+}
+
+
+def _node_text(node: Tag) -> str:
+    return re.sub(r"\s+", " ", " ".join(node.stripped_strings)).strip()
+
+
+def _is_heading_node(node: Tag) -> bool:
+    if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        return True
+    classes = set(node.get("class", []))
+    if node.name == "div" and "mw-heading" in classes:
+        return node.find(re.compile(r"^h[1-6]$")) is not None
+    return False
+
+
+def _extract_heading(node: Tag) -> Optional[Tuple[str, int]]:
+    heading = node if re.fullmatch(r"h[1-6]", node.name or "") else node.find(re.compile(r"^h[1-6]$"))
+    if heading is None:
+        return None
+    title = _node_text(heading)
+    if not title:
+        return None
+    try:
+        level = int(heading.name[1])
+    except Exception:
+        level = 2
+    return title, level
+
+
+def _should_skip_block(node: Tag) -> bool:
+    classes = set(node.get("class", []))
+    if classes & _SKIP_BLOCK_CLASSES:
+        return True
+    if node.name in {"style", "script", "noscript"}:
+        return True
+    return False
+
+
+def _parse_html_table(table: Tag) -> List[str]:
+    classes = set(table.get("class", []))
+    if classes & _SKIP_TABLE_CLASSES:
+        return []
+
+    caption = ""
+    cap = table.find("caption")
+    if cap is not None:
+        caption = _node_text(cap)
+
+    rows: List[List[str]] = []
+    for tr in table.find_all("tr"):
+        if tr.find_parent("table") is not table:
+            continue
+        row: List[str] = []
+        for cell in tr.find_all(["th", "td"], recursive=False):
+            text = _node_text(cell)
+            if not text:
+                continue
+            try:
+                span = max(1, int(cell.get("colspan", 1)))
+            except Exception:
+                span = 1
+            for _ in range(span):
+                row.append(text)
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return []
+
+    out: List[str] = []
+    if caption:
+        out.append(f"表格: {caption}")
+
+    header = rows[0] if len(rows) >= 2 else []
+    body = rows[1:] if header else rows
+
+    if header and len(header) >= 2:
+        for row in body:
+            rr = row[:len(header)] + [""] * max(0, len(header) - len(row))
+            items = [f"{header[i]}: {rr[i]}" for i in range(len(header)) if rr[i]]
+            if items:
+                out.append(" | ".join(items))
+    else:
+        for row in body:
+            line = " | ".join(x for x in row if x)
+            if line:
+                out.append(line)
+
+    return out
+
+
+def _render_html_block(node: Tag) -> List[str]:
+    if _should_skip_block(node):
+        return []
+
+    if node.name == "table":
+        return _parse_html_table(node)
+
+    if node.name in {"ul", "ol"}:
+        out: List[str] = []
+        for idx, li in enumerate(node.find_all("li", recursive=False), 1):
+            text = _node_text(li)
+            if not text:
+                continue
+            prefix = f"{idx}. " if node.name == "ol" else "- "
+            out.append(prefix + text)
+        return out
+
+    if node.name == "dl":
+        out: List[str] = []
+        for child in node.find_all(["dt", "dd"], recursive=False):
+            text = _node_text(child)
+            if text:
+                out.append(text)
+        return out
+
+    if node.name == "pre":
+        text = node.get_text("\n", strip=True)
+        return [text] if text else []
+
+    if node.name == "div":
+        lines: List[str] = []
+        for child in node.children:
+            if isinstance(child, NavigableString):
+                continue
+            if not isinstance(child, Tag):
+                continue
+            lines.extend(_render_html_block(child))
+        if lines:
+            return lines
+
+    text = _node_text(node)
+    return [text] if text else []
+
+
+def _html_to_sections(html: str) -> List[Dict]:
+    soup = BeautifulSoup(html, "lxml")
+    for node in soup.select("style, script, noscript, sup.reference, .mw-editsection, .reference, .reflist"):
+        node.decompose()
+
+    root = soup.select_one("div.mw-parser-output") or soup
+    sections: List[Dict] = []
+
+    stack: List[Tuple[str, int]] = []
+    current_title = "导言"
+    current_level = 1
+    current_parent = None
+    current_path = "导言"
+    current_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        text = "\n".join(x for x in current_lines if x).strip()
+        if text:
+            sections.append(
+                {
+                    "title": current_title,
+                    "level": current_level,
+                    "parent": current_parent,
+                    "path": current_path,
+                    "text": text,
+                }
+            )
+        current_lines = []
+
+    for child in root.children:
+        if isinstance(child, NavigableString):
+            continue
+        if not isinstance(child, Tag):
+            continue
+
+        if _is_heading_node(child):
+            heading = _extract_heading(child)
+            if not heading:
+                continue
+            flush()
+
+            title, level = heading
+            while stack and stack[-1][1] >= level:
+                stack.pop()
+
+            parent = stack[-1][0] if stack else None
+            path = "/".join([item[0] for item in stack] + [title]) if stack else title
+
+            current_title = title
+            current_level = level
+            current_parent = parent
+            current_path = path
+            stack.append((title, level))
+            continue
+
+        current_lines.extend(_render_html_block(child))
+
+    flush()
+    return sections
+
+
+def _sections_to_page_text(sections: List[Dict]) -> str:
+    parts: List[str] = []
+    for sec in sections:
+        title = (sec.get("title") or "").strip()
+        text = (sec.get("text") or "").strip()
+        if not text:
+            continue
+        if title and title != "导言":
+            level = max(1, int(sec.get("level") or 2) - 1)
+            parts.append("#" * level + " " + title)
+        parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def parse_wikitext_via_api(title: str, text: str, timeout: int = 45, *,
+                           retries: int = 4,
+                           backoff_base: float = 1.4,
+                           max_text_len: int = 120000) -> Optional[Dict]:
+    if not _HAS_BS4:
+        return None
+
+    k = _expand_cache_key(title, text)
+    cached = _parse_cache_get(k)
+    if cached is not None:
+        return cached
+
+    if len(text) > max_text_len:
+        return None
+
+    payload = {
+        "action": "parse",
+        "format": "json",
+        "prop": "text",
+        "title": title,
+        "text": text,
+        "contentmodel": "wikitext",
+        "disableeditsection": 1,
+        "disablelimitreport": 1,
+        "disabletoc": 1,
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.post(API_URL, data=payload, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+
+            r.raise_for_status()
+            data = r.json()
+            html = (((data.get("parse") or {}).get("text") or {}).get("*") or "").strip()
+            if not html:
+                return None
+
+            sections = _html_to_sections(html)
+            result = {
+                "text": _sections_to_page_text(sections),
+                "sections": sections,
+            }
+            _parse_cache_put(k, result)
+            _parse_cache_append(k, result)
+            return result
+
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            if attempt >= retries:
+                return None
+
+            sleep_s = (backoff_base ** attempt) + random.random() * 0.3
+            try:
+                resp = getattr(e, "response", None)
+                if resp is not None and getattr(resp, "status_code", None) == 429:
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        sleep_s = max(sleep_s, float(ra))
+            except Exception:
+                pass
+            time.sleep(sleep_s)
+
+        except Exception:
+            return None
+
+    return None
 def _strip_markup(text: str) -> str:
     if _HAS_MW:
         try:
@@ -619,6 +990,7 @@ def main():
         for line_no, line in enumerate(fin, 1):
             obj = json.loads(line)
             title = obj.get("title", "")
+            api_title = _resolve_api_title(obj)
 
             if line_no % 50 == 0:
                 print(f"[{line_no}] processing: {title}")
@@ -626,19 +998,28 @@ def main():
             raw = obj.get("wikitext") or ""
 
             t1 = time.time()
-            raw_exp = expand_templates(title, raw)   # ✅ 只 expand 一次
-            print(f"  expand {title}  {time.time()-t1:.2f}s  len={len(raw_exp)}")
+            parsed = parse_wikitext_via_api(api_title, raw)
+            print(f"  parse  {title}  {time.time()-t1:.2f}s  ok={parsed is not None}")
 
-            t2 = time.time()
-            cleaned = clean_wikitext(raw_exp)
-            print(f"  clean  {title}  {time.time()-t2:.2f}s  len={len(cleaned)}")
+            if parsed is not None:
+                cleaned = parsed.get("text") or ""
+                sections = parsed.get("sections") or []
+            else:
+                t2 = time.time()
+                raw_exp = expand_templates(api_title, raw)
+                print(f"  expand {title}  {time.time()-t2:.2f}s  len={len(raw_exp)}")
+
+                t3 = time.time()
+                cleaned = clean_wikitext(raw_exp)
+                sections = _convert_sections(api_title, obj.get("sections"))
+                print(f"  clean  {title}  {time.time()-t3:.2f}s  len={len(cleaned)}")
 
             rec = {
                 "title": obj["title"],
                 "url": obj["url"],
                 "text": cleaned,
                 "redirect_targets": _extract_for_targets(raw),  # raw 或 raw_exp 都行；看你想提取“原始重定向模板”还是展开后的
-                "sections": _convert_sections(title, obj.get("sections")),
+                "sections": sections,
             }
 
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")

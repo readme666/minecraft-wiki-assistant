@@ -47,6 +47,33 @@ fn read_debug_mode(data_dir: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
+fn backend_python_candidates(exe_dir: &PathBuf, debug_mode: bool) -> Vec<PathBuf> {
+    let bundled_pythonw = exe_dir.join("python").join("pythonw.exe");
+    let bundled_python = exe_dir.join("python").join("python.exe");
+
+    let mut candidates = Vec::new();
+
+    if debug_mode {
+        if bundled_python.exists() {
+            candidates.push(bundled_python);
+        }
+        candidates.push(PathBuf::from("python"));
+    } else {
+        if bundled_pythonw.exists() {
+            candidates.push(bundled_pythonw);
+        }
+        if bundled_python.exists() {
+            candidates.push(bundled_python);
+        }
+
+        // 项目内未携带 Python 时，回退到系统默认 Python 环境。
+        candidates.push(PathBuf::from("pythonw"));
+        candidates.push(PathBuf::from("python"));
+    }
+
+    candidates
+}
+
 fn start_backend(data_dir: Option<PathBuf>, debug_mode: bool) -> Option<Child> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     
@@ -56,41 +83,36 @@ fn start_backend(data_dir: Option<PathBuf>, debug_mode: bool) -> Option<Child> {
         return None;
     }
 
-    // ✅ 正常模式优先 pythonw.exe（无黑框），调试模式用 python.exe
-    // ✅ 如果 pythonw.exe 不存在，就 fallback python.exe，但仍用 CREATE_NO_WINDOW 双保险隐藏
-    let pythonw = exe_dir.join("python").join("pythonw.exe");
-    let python = exe_dir.join("python").join("python.exe");
+    for python_bin in backend_python_candidates(&exe_dir, debug_mode) {
+        let mut cmd = Command::new(&python_bin);
+        cmd.arg(&server)
+            .current_dir(&exe_dir)
+            .env("BACKEND_PORT", "8000");
 
-    let python_bin = if debug_mode {
-        python.clone()
-    } else if pythonw.exists() {
-        pythonw.clone()
-    } else {
-        python.clone()
-    };
+        // 把 tauri 的 app_data_dir 传给 python（统一 config/logs 目录）
+        if let Some(d) = data_dir.as_ref() {
+            cmd.env("MWA_DATA_DIR", d);
+        }
 
-    if !python_bin.exists() {
-        eprintln!("[backend] python not found: {:?}", python_bin);
-        return None;
+        // Windows 下非调试强制不弹窗；即使回退到 python.exe 也隐藏控制台
+        #[cfg(target_os = "windows")]
+        if !debug_mode {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                eprintln!("[backend] started with {:?}", python_bin);
+                return Some(child);
+            }
+            Err(err) => {
+                eprintln!("[backend] failed to start with {:?}: {}", python_bin, err);
+            }
+        }
     }
 
-    let mut cmd = Command::new(python_bin);
-    cmd.arg(server)
-        .current_dir(&exe_dir)
-        .env("BACKEND_PORT", "8000");
-
-    // ✅ 把 tauri 的 app_data_dir 传给 python（统一 config/logs 目录）
-    if let Some(d) = data_dir {
-        cmd.env("MWA_DATA_DIR", d);
-    }
-
-    // ✅ 双保险：Windows 下非调试强制不弹窗（即使 fallback 到 python.exe）
-    #[cfg(target_os = "windows")]
-    if !debug_mode {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    cmd.spawn().ok()
+    eprintln!("[backend] no usable python runtime found");
+    None
 }
 
 fn stop_backend(child: &mut Child) {

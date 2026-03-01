@@ -1,253 +1,217 @@
-# 🧠 Minecraft Wiki 助手
+# Minecraft Wiki Assistant
 
-> 基于本地向量检索（FAISS）+ 本地 Embedding 模型 + DeepSeek 大模型的桌面级 RAG 问答系统。
+一个面向 Minecraft 中文 Wiki 的桌面 RAG 问答工具。  
+项目使用本地向量检索定位 Wiki 证据，再调用 DeepSeek 生成最终回答。检索、索引和 Embedding 都在本地完成，联网部分只用于调用大模型接口。
 
-一个面向 Minecraft 中文 Wiki 的智能问答助手，
-通过本地语义检索与大模型推理，实现高质量、可追溯的回答生成。
+## 功能概览
 
----
+- 基于 `FAISS` 的本地向量检索
+- 本地 `Sentence-Transformers` Embedding 模型
+- `DeepSeek` 生成最终回答
+- 桌面端基于 `Tauri`
+- 后端服务基于 `FastAPI`
+- 支持证据引用、会话历史、成本估算、日志查看
+- 支持命令行调用 `backend/rag_cli.py`
 
-# ✨ 项目特点
+## 当前架构
 
-* 🔍 **本地语义检索（FAISS）**
-* 📚 完整 Minecraft Wiki 向量索引
-* 🧠 本地 Embedding 模型推理（无需联网）
-* 🎯 自动义项消歧
-* 🔐 API Key 默认仅内存保存（更安全）
-* 🚀 基于 Tauri 构建的桌面应用
-* 📦 内嵌 Python 运行环境（无需安装 Python）
-
----
-
-# 🏗 技术架构
-
-```
+```text
 用户问题
-    ↓
-问题分类
-    ↓
-检索计划生成
-    ↓
-FAISS 向量检索（本地）
-    ↓
-证据整合
-    ↓
-DeepSeek LLM 生成最终回答
+  -> 问题分类 / 查询改写
+  -> 本地 FAISS 检索
+  -> 证据后处理与扩展
+  -> DeepSeek 生成回答
+  -> 返回答案 + 证据 + token / cost 信息
 ```
 
-Embedding 模型：
+核心本地模型：
 
-```
+```text
 sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-向量推理完全在本地执行。
+## 项目结构
 
----
-
-# 📦 Release 目录结构
-
-```
-Release/
-│
-├── minecraft-wiki-assistant.exe     # 主程序
-│
-├── python/                          # 内嵌 Python 运行环境
-│
+```text
+source/
+├── backend/
+│   ├── backend.py
+│   └── rag_cli.py
 ├── pyserver/
-│   ├── server.py                    # FastAPI 后端
-│   ├── models/                      # 本地 embedding 模型
+│   ├── server.py
 │   └── requirements.txt
-│
+├── tauri-app/
+│   ├── src/
+│   └── src-tauri/
+├── data_pipeline/
 ├── index/
-│   ├── faiss_all.index              # 向量索引文件
-│   └── meta_all.jsonl               # 元数据
-│
-├── rag_cli.py                       # RAG 核心逻辑
-├── backend.py                       # GUI 调用入口
-└── config.py                        # 配置系统
+├── chunks/
+├── data/
+├── titles/
+├── xml/
+├── config.py
+└── minecraft-wiki-assistant.exe
 ```
 
----
+## 运行方式
 
-# 🚀 使用方法
+### 1. 直接运行已打包版本
 
-## Windows
+仓库根目录已经包含：
 
-1. 下载 Release 包
-2. 双击运行：
-
-```
-minecraft-wiki-assistant.exe
+```powershell
+.\minecraft-wiki-assistant.exe
 ```
 
-无需安装 Python。
+桌面程序启动后会拉起后端。
+如果项目目录下存在内置 `python/` 运行时，会优先使用它；如果不存在，则会自动回退到系统默认 Python 环境。
 
----
+### 2. 本地开发运行
 
-# 🔑 API Key 配置
+前提：
 
-本程序需要使用 **DeepSeek API Key**。
+- Python 3.10+
+- Node.js 18+
+- Rust / Cargo
+- 已准备好 `index/faiss_all.index` 和 `index/meta_all.jsonl`
 
-* 在设置中填写 API Key
-* 默认仅保存在内存中
-* 不写入磁盘（除非手动修改代码）
+安装 Python 依赖：
 
-若无法生成回答，请检查：
-
-* API Key 是否正确
-* 是否能访问 `https://api.deepseek.com`
-
----
-
-# 🌐 网络需求说明
-
-| 模块           | 是否需要联网 |
-| ------------ | ------ |
-| Embedding 模型 | ❌ 不需要  |
-| 向量检索         | ❌ 不需要  |
-| HuggingFace  | ❌ 不需要  |
-| DeepSeek API | ✅ 需要   |
-
-程序本身完全离线，仅在生成最终答案时调用 DeepSeek API。
-
----
-
-# 📁 数据存储路径
-
-Windows 默认：
-
-```
-C:\Users\<用户名>\AppData\Roaming\com.minecraft.wiki.assistant\
+```powershell
+pip install -r pyserver/requirements.txt
 ```
 
-包含：
+如果你是从源码编译并运行项目，而且使用的是本机 Python（而不是项目内置的 `python/` 目录），则必须先按 [pyserver/requirements.txt](/c:/minecraft-ass/source/pyserver/requirements.txt) 安装这些依赖。
 
-* logs/
-* config.json（不含 api_key）
+启动前端开发环境：
 
----
-
-# 📝 日志说明
-
-日志文件位置：
-
+```powershell
+cd tauri-app
+npm install
+npm run tauri dev
 ```
+
+### 3. 单独运行命令行问答
+
+```powershell
+python backend/rag_cli.py --question "村民会卖什么" --api-key "<YOUR_DEEPSEEK_KEY>"
+```
+
+或进入交互模式：
+
+```powershell
+python backend/rag_cli.py --interactive --api-key "<YOUR_DEEPSEEK_KEY>"
+```
+
+## 配置说明
+
+应用实际会使用两类配置：
+
+- 后端配置文件：`config.json`
+- 前端本地缓存：浏览器 `localStorage`
+
+其中：
+
+- `api_key` 默认不会写入后端 `config.json`
+- 桌面端设置页里填写的 API Key 会保存在前端本地存储，用于后续请求时传给后端
+- 其余设置如 `api_base`、`model`、`font_size`、`debug_mode` 会写入配置文件
+
+默认配置项可在 [config.py](/c:/minecraft-ass/source/config.py) 中查看，包括：
+
+- `api_base`
+- `model`
+- `cache_hit_rate`
+- `input_hit_per_million`
+- `input_miss_per_million`
+- `output_per_million`
+- `font_size`
+- `debug_mode`
+
+## 数据目录
+
+运行时配置和日志目录由环境变量 `MWA_DATA_DIR` 决定。  
+在桌面版中，这个路径由 Tauri 的 `app_data_dir` 注入，通常位于应用数据目录下，包含：
+
+```text
+config.json
+logs/
+```
+
+## 日志
+
+后端日志位于：
+
+```text
 logs/server.log
 ```
 
-如遇问题，请提供该文件内容。
+如果后端启动失败，还可能出现：
 
----
-
-# 🧩 技术栈
-
-* FastAPI
-* FAISS（CPU）
-* Sentence-Transformers
-* Transformers
-* PyTorch（CPU）
-* DeepSeek API
-* Tauri（Rust + WebView）
-
----
-
-# ⚙️ 性能说明
-
-推荐配置：
-
-* CPU：i5 / Ryzen 5 及以上
-* 内存：16GB+
-* 建议使用 SSD
-
-响应时间参考：
-
-| 设备      | 单次回答时间  |
-| ------- | ------- |
-| 桌面级 CPU | 30~60 秒 |
-| 低功耗笔记本  | 1~4 分钟  |
-
-首次启动会进行 warmup，可能较慢。
-
----
-
-# 🔒 安全说明
-
-* API Key 默认不落盘
-* 不包含遥测
-* 不进行 HuggingFace 在线下载
-* 无后台常驻进程
-
----
-
-# ⚠ 已知限制
-
-* 目前仅支持 Windows
-* CPU 推理，未启用 GPU
-* 长问题响应时间较长
-* 检索策略仍在优化中
-
----
-
-# 🎯 后续规划
-
-* [ ] 检索速度优化
-* [ ] 并行化改进
-* [ ] 更精细的义项消歧策略
-* [ ] 可选 GPU 加速
-* [ ] Linux / macOS 支持
-* [ ] 插件化检索策略
-
----
-
-# 📜 模型与许可证
-
-Embedding 模型：
-
-```
-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```text
+logs/fatal.log
 ```
 
-许可证：Apache 2.0
+## 数据构建流程
 
-请在二次分发时遵守相关许可证。
+如果你需要从 Wiki 原始数据重建索引，流程对应 `data_pipeline/` 下的脚本：
 
----
-
-# 📌 当前版本
-
+```text
+00collect_allpages.py   获取页面标题
+01xmltojson.py          将 XML dump 转为 JSONL
+02dumptoparsed.py       展开模板并解析页面
+03parsedtochunk.py      切分 chunk
+04buildindex.py         生成向量索引与元数据
 ```
-v0.1.0
+
+最终产物是：
+
+```text
+index/faiss_all.index
+index/meta_all.jsonl
 ```
 
----
+说明：
 
-# 💬 项目说明
+- `00collect_allpages.py`、`02dumptoparsed.py` 需要访问 Minecraft Wiki API
+- `04buildindex.py` 会加载本地或 Hugging Face 模型来生成 Embedding
 
-本项目旨在探索：
+## 技术栈
 
-> 在本地构建大规模知识库的语义检索系统，并结合远程大模型进行推理生成。
+- Tauri 2
+- Vite
+- FastAPI
+- FAISS CPU
+- Sentence-Transformers
+- Transformers
+- PyTorch CPU
+- DeepSeek API
 
-目标是在：
+## 已知限制
 
-* 本地可控
-* 语义准确
-* 可解释
-* 工程可部署
+- 当前主要面向 Windows
+- 默认是 CPU 推理，首次启动会有 warmup
+- 回答质量依赖本地索引和 DeepSeek 输出
+- 如果缺少 `index` 文件，后端无法完成检索
+- 若未配置 API Key，只能启动界面，无法生成最终回答
 
-之间取得平衡。
+## 构建打包
 
----
+仓库里已经有一个简单的打包脚本：
 
-# 🤝 欢迎反馈
+```powershell
+.\test.bat
+```
 
-如有问题或建议，请提交 Issue，并附：
+它会执行：
 
-* 系统配置
-* 日志文件
-* 示例问题
-* 期望行为
+1. `tauri-app` 内的 `npm run tauri build`
+2. 将生成的 EXE 复制到仓库根目录
+3. 直接启动打包产物
 
----
+## 版本
 
----
+当前版本号在 [tauri-app/package.json](/c:/minecraft-ass/source/tauri-app/package.json) 和 [tauri-app/src-tauri/tauri.conf.json](/c:/minecraft-ass/source/tauri-app/src-tauri/tauri.conf.json) 中均为：
+
+```text
+0.1.0
+```

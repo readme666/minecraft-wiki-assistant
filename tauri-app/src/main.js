@@ -16,10 +16,16 @@ const inputArea = document.getElementById("inputArea");
 const sendBtn = document.getElementById("sendBtn");
 const statusLabel = document.getElementById("statusLabel");
 const settingsBtn = document.getElementById("settingsBtn");
+const aboutToggleBtn = document.getElementById("aboutToggleBtn");
 const appTitle = document.querySelector(".topbar .title");
 const LS_API_KEY = "mw_assistant_api_key";
 const settingsModal = document.getElementById("settingsModal");
 const settingsModalContent = settingsModal?.querySelector(".modal-content");
+const settingsModalTitle = settingsModal?.querySelector(".modal-title");
+const donateModal = document.getElementById("donateModal");
+const donateModalContent = donateModal?.querySelector(".modal-content");
+const donatePreviewBtn = document.getElementById("donatePreviewBtn");
+const donateCloseBtn = document.getElementById("donateCloseBtn");
 const settingsSave = document.getElementById("settingsSave");
 const settingsCancel = document.getElementById("settingsCancel");
 const restartNotice = document.getElementById("restartNotice");
@@ -29,8 +35,10 @@ const LS_ACTIVE_SESSION = "mw_assistant_active_session_v1";
 
 const apiKeyNotice = document.getElementById("apiKeyNotice");
 const apiKeyNoticeLink = document.getElementById("apiKeyNoticeLink");
+const aboutPage = document.getElementById("aboutPage");
 
 const cfgApiKey = document.getElementById("cfgApiKey");
+const deepseekApiKeyLink = document.getElementById("deepseekApiKeyLink");
 const cfgApiBase = document.getElementById("cfgApiBase");
 const cfgModel = document.getElementById("cfgModel");
 const cfgCacheHit = document.getElementById("cfgCacheHit");
@@ -46,7 +54,442 @@ let draftSession = null;
 let nearBottom = true;
 let lastLoadedSettingsSnapshot = null;
 let settingsModalCloseTimer = null;
+let donateModalCloseTimer = null;
+let settingsModalAnimation = null;
+let settingsModalOriginEl = null;
+let settingsModalOriginRevealTimer = null;
 let animatedSessionId = null;
+let currentView = "chat";
+let viewTransitionTimer = null;
+let isViewTransitioning = false;
+const SETTINGS_MODAL_ANIMATION_MS = 420;
+const SETTINGS_MODAL_CONTENT_FADE_MS = 260;
+
+function prefersReducedMotion() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function ensureSettingsModalMorphEl() {
+  let shell = document.getElementById("settingsModalMorph");
+  let label = shell?.querySelector(".settings-modal-morph-label");
+  if (shell && label) return { shell, label };
+
+  shell = document.createElement("div");
+  shell.id = "settingsModalMorph";
+  shell.className = "settings-modal-morph";
+  shell.setAttribute("aria-hidden", "true");
+
+  label = document.createElement("span");
+  label.className = "settings-modal-morph-label";
+  label.setAttribute("aria-hidden", "true");
+  shell.appendChild(label);
+  document.body.appendChild(shell);
+
+  return { shell, label };
+}
+
+function clearSettingsModalMorphEl() {
+  const shell = document.getElementById("settingsModalMorph");
+  if (shell) {
+    shell.classList.remove("visible");
+    shell.removeAttribute("style");
+    const label = shell.querySelector(".settings-modal-morph-label");
+    if (label) {
+      label.classList.remove("visible");
+      label.removeAttribute("style");
+      label.textContent = "";
+    }
+  }
+}
+
+function setSettingsOriginVisibility(hidden) {
+  if (!settingsModalOriginEl) return;
+  if (hidden) {
+    settingsModalOriginEl.style.visibility = "hidden";
+    settingsModalOriginEl.style.pointerEvents = "none";
+    return;
+  }
+  settingsModalOriginEl.style.removeProperty("visibility");
+  settingsModalOriginEl.style.removeProperty("pointer-events");
+}
+
+function clearSettingsModalAnimationState() {
+  settingsModal?.classList.remove("settings-morphing", "settings-morph-open", "settings-morph-close");
+  settingsModalContent?.style.removeProperty("opacity");
+  settingsModalContent?.style.removeProperty("transform");
+  settingsModalContent?.style.removeProperty("filter");
+  settingsModalContent?.style.removeProperty("pointer-events");
+  settingsModalTitle?.style.removeProperty("opacity");
+  setSettingsOriginVisibility(false);
+  clearSettingsModalMorphEl();
+}
+
+function cancelSettingsModalAnimation() {
+  if (settingsModalOriginRevealTimer) {
+    window.clearTimeout(settingsModalOriginRevealTimer);
+    settingsModalOriginRevealTimer = null;
+  }
+  if (!settingsModalAnimation) return;
+  Object.values(settingsModalAnimation).forEach((animation) => animation?.cancel?.());
+  settingsModalAnimation = null;
+  clearSettingsModalAnimationState();
+}
+
+function getElementRadius(element, fallback = 16) {
+  if (!element) return fallback;
+  const radius = parseFloat(window.getComputedStyle(element).borderTopLeftRadius);
+  return Number.isFinite(radius) ? radius : fallback;
+}
+
+function setMorphRect(shell, rect, radius) {
+  shell.style.left = `${rect.left}px`;
+  shell.style.top = `${rect.top}px`;
+  shell.style.width = `${rect.width}px`;
+  shell.style.height = `${rect.height}px`;
+  shell.style.borderRadius = `${radius}px`;
+}
+
+function getMorphLabel(originEl) {
+  const text = originEl?.textContent?.replace(/\s+/g, " ").trim() || "";
+  return text.length > 0 && text.length <= 8 ? text : "";
+}
+
+function animateSettingsModalMorph(direction, originEl, onFinish) {
+  if (!settingsModal || !settingsModalContent || !settingsModalTitle || !originEl) return false;
+
+  const originRect = originEl.getBoundingClientRect();
+  const modalRect = settingsModalContent.getBoundingClientRect();
+  const titleRect = settingsModalTitle.getBoundingClientRect();
+  if (
+    !originRect.width ||
+    !originRect.height ||
+    !modalRect.width ||
+    !modalRect.height ||
+    !titleRect.width ||
+    !titleRect.height
+  ) {
+    return false;
+  }
+
+  cancelSettingsModalAnimation();
+
+  const { shell, label: shellLabel } = ensureSettingsModalMorphEl();
+  const opening = direction === "open";
+  const originRadius = getElementRadius(originEl, 14);
+  const modalRadius = getElementRadius(settingsModalContent, 28);
+  const easing = opening
+    ? "cubic-bezier(0.22, 1, 0.36, 1)"
+    : "cubic-bezier(0.32, 0.02, 0.16, 1)";
+  const shellMidRect = opening
+    ? {
+        left: originRect.left + (modalRect.left - originRect.left) * 0.22,
+        top: originRect.top + (modalRect.top - originRect.top) * 0.16,
+        width: originRect.width + (modalRect.width - originRect.width) * 0.56,
+        height: originRect.height + (modalRect.height - originRect.height) * 0.34
+      }
+    : {
+        left: modalRect.left + (originRect.left - modalRect.left) * 0.4,
+        top: modalRect.top + (originRect.top - modalRect.top) * 0.32,
+        width: modalRect.width + (originRect.width - modalRect.width) * 0.5,
+        height: modalRect.height + (originRect.height - modalRect.height) * 0.46
+      };
+  const titleStartLeft = Math.max((originRect.width - titleRect.width) / 2, 0);
+  const titleStartTop = Math.max((originRect.height - titleRect.height) / 2, 0);
+  const titleEndLeft = titleRect.left - modalRect.left;
+  const titleEndTop = titleRect.top - modalRect.top;
+  const titleMidLeft = opening
+    ? titleStartLeft + (titleEndLeft - titleStartLeft) * 0.58
+    : titleEndLeft + (titleStartLeft - titleEndLeft) * 0.52;
+  const titleMidTop = opening
+    ? titleStartTop + (titleEndTop - titleStartTop) * 0.58
+    : titleEndTop + (titleStartTop - titleEndTop) * 0.52;
+  const originFontSize = parseFloat(window.getComputedStyle(originEl).fontSize) || 14;
+  const targetFontSize = parseFloat(window.getComputedStyle(settingsModalTitle).fontSize) || 18;
+  const fontScale = Math.min(Math.max(originFontSize / targetFontSize, 0.72), 1.18);
+
+  settingsModal.classList.add("settings-morphing", opening ? "settings-morph-open" : "settings-morph-close");
+  setSettingsOriginVisibility(true);
+  settingsModalContent.style.pointerEvents = "none";
+  settingsModalContent.style.opacity = opening ? "0" : "1";
+  settingsModalContent.style.transform = opening
+    ? "translate3d(0, 18px, 0) scale(0.986)"
+    : "translate3d(0, 0, 0) scale(1)";
+  settingsModalContent.style.filter = opening ? "blur(6px)" : "blur(0)";
+  settingsModalTitle.style.opacity = opening ? "0" : "0";
+
+  setMorphRect(shell, opening ? originRect : modalRect, opening ? originRadius : modalRadius);
+  shell.classList.add("visible");
+  shell.style.transformOrigin = "0 0";
+
+  if (shellLabel) {
+    shellLabel.textContent = getMorphLabel(originEl);
+    shellLabel.classList.add("visible");
+    shellLabel.style.left = `${opening ? titleStartLeft : titleEndLeft}px`;
+    shellLabel.style.top = `${opening ? titleStartTop : titleEndTop}px`;
+    shellLabel.style.width = `${titleRect.width}px`;
+    shellLabel.style.height = `${titleRect.height}px`;
+    shellLabel.style.fontSize = window.getComputedStyle(settingsModalTitle).fontSize;
+    shellLabel.style.fontWeight = window.getComputedStyle(settingsModalTitle).fontWeight;
+    shellLabel.style.lineHeight = window.getComputedStyle(settingsModalTitle).lineHeight;
+    shellLabel.style.letterSpacing = window.getComputedStyle(settingsModalTitle).letterSpacing;
+    shellLabel.style.transformOrigin = "left top";
+  }
+
+  const overlayFrames = opening
+    ? [{ opacity: 0 }, { opacity: 0.72, offset: 0.65 }, { opacity: 1 }]
+    : [{ opacity: 1 }, { opacity: 0.68, offset: 0.35 }, { opacity: 0 }];
+  const shellFrames = opening
+    ? [
+        {
+          left: `${originRect.left}px`,
+          top: `${originRect.top}px`,
+          width: `${originRect.width}px`,
+          height: `${originRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${originRadius}px`,
+          opacity: 0.98,
+          boxShadow: "0 10px 24px rgba(0, 0, 0, 0.16)"
+        },
+        {
+          offset: 0.62,
+          left: `${shellMidRect.left}px`,
+          top: `${shellMidRect.top}px`,
+          width: `${shellMidRect.width}px`,
+          height: `${shellMidRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${Math.round(originRadius + (modalRadius - originRadius) * 0.62)}px`,
+          opacity: 1,
+          boxShadow: "0 22px 44px rgba(0, 0, 0, 0.24)"
+        },
+        {
+          offset: 0.84,
+          left: `${modalRect.left}px`,
+          top: `${modalRect.top}px`,
+          width: `${modalRect.width}px`,
+          height: `${modalRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${modalRadius}px`,
+          opacity: 0.94,
+          boxShadow: "0 28px 54px rgba(0, 0, 0, 0.32)"
+        },
+        {
+          left: `${modalRect.left}px`,
+          top: `${modalRect.top}px`,
+          width: `${modalRect.width}px`,
+          height: `${modalRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${modalRadius}px`,
+          opacity: 0,
+          boxShadow: "0 28px 54px rgba(0, 0, 0, 0.32)"
+        }
+      ]
+    : [
+        {
+          left: `${modalRect.left}px`,
+          top: `${modalRect.top}px`,
+          width: `${modalRect.width}px`,
+          height: `${modalRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${modalRadius}px`,
+          opacity: 0.98,
+          boxShadow: "0 28px 54px rgba(0, 0, 0, 0.32)"
+        },
+        {
+          offset: 0.2,
+          left: `${modalRect.left}px`,
+          top: `${modalRect.top}px`,
+          width: `${modalRect.width}px`,
+          height: `${modalRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${modalRadius}px`,
+          opacity: 0.98,
+          boxShadow: "0 28px 54px rgba(0, 0, 0, 0.32)"
+        },
+        {
+          offset: 0.68,
+          left: `${shellMidRect.left}px`,
+          top: `${shellMidRect.top}px`,
+          width: `${shellMidRect.width}px`,
+          height: `${shellMidRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${Math.round(originRadius + (modalRadius - originRadius) * 0.58)}px`,
+          opacity: 1,
+          boxShadow: "0 20px 40px rgba(0, 0, 0, 0.22)"
+        },
+        {
+          offset: 0.9,
+          left: `${originRect.left}px`,
+          top: `${originRect.top}px`,
+          width: `${originRect.width}px`,
+          height: `${originRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${originRadius}px`,
+          opacity: 0.42,
+          boxShadow: "0 6px 12px rgba(0, 0, 0, 0.08)"
+        },
+        {
+          left: `${originRect.left}px`,
+          top: `${originRect.top}px`,
+          width: `${originRect.width}px`,
+          height: `${originRect.height}px`,
+          transform: "translate3d(0, 0, 0) scale(1)",
+          borderRadius: `${originRadius}px`,
+          opacity: 0.12,
+          boxShadow: "0 4px 10px rgba(0, 0, 0, 0.06)"
+        }
+      ];
+  const contentFrames = opening
+    ? [
+        {
+          opacity: 0,
+          transform: "translate3d(0, 18px, 0) scale(0.986)",
+          filter: "blur(6px)"
+        },
+        {
+          offset: 0.48,
+          opacity: 0.58,
+          transform: "translate3d(0, 8px, 0) scale(0.994)",
+          filter: "blur(2px)"
+        },
+        { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)", filter: "blur(0)" }
+      ]
+    : [
+        { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)", filter: "blur(0)" },
+        {
+          offset: 0.18,
+          opacity: 0.24,
+          transform: "translate3d(0, 5px, 0) scale(0.994)",
+          filter: "blur(2px)"
+        },
+        { opacity: 0, transform: "translate3d(0, 10px, 0) scale(0.985)", filter: "blur(6px)", offset: 0.36 },
+        { opacity: 0, transform: "translate3d(0, 10px, 0) scale(0.985)", filter: "blur(6px)" }
+      ];
+  const labelFrames = opening
+    ? [
+        {
+          opacity: 1,
+          left: `${titleStartLeft}px`,
+          top: `${titleStartTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${fontScale})`
+        },
+        {
+          offset: 0.6,
+          opacity: 0.96,
+          left: `${titleMidLeft}px`,
+          top: `${titleMidTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${1 - (1 - fontScale) * 0.42})`
+        },
+        {
+          opacity: 0,
+          left: `${titleEndLeft}px`,
+          top: `${titleEndTop}px`,
+          transform: "translate3d(0, 0, 0) scale(1)"
+        }
+      ]
+    : [
+        {
+          opacity: 1,
+          left: `${titleEndLeft}px`,
+          top: `${titleEndTop}px`,
+          transform: "translate3d(0, 0, 0) scale(1)"
+        },
+        {
+          offset: 0.32,
+          opacity: 0.98,
+          left: `${titleMidLeft}px`,
+          top: `${titleMidTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${1 - (1 - fontScale) * 0.48})`
+        },
+        {
+          offset: 0.72,
+          opacity: 0.96,
+          left: `${titleStartLeft}px`,
+          top: `${titleStartTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${fontScale})`
+        },
+        {
+          offset: 0.9,
+          opacity: 0.36,
+          left: `${titleStartLeft}px`,
+          top: `${titleStartTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${fontScale})`
+        },
+        {
+          opacity: 0.08,
+          left: `${titleStartLeft}px`,
+          top: `${titleStartTop}px`,
+          transform: `translate3d(0, 0, 0) scale(${fontScale})`
+        }
+      ];
+  const modalTitleFrames = opening ? [{ opacity: 0 }, { opacity: 0, offset: 0.64 }, { opacity: 1 }] : null;
+
+  const overlayAnimation = settingsModal.animate(overlayFrames, {
+    duration: SETTINGS_MODAL_ANIMATION_MS,
+    easing,
+    fill: "forwards"
+  });
+  const shellAnimation = shell.animate(shellFrames, {
+    duration: SETTINGS_MODAL_ANIMATION_MS,
+    easing,
+    fill: "forwards"
+  });
+  const contentAnimation = settingsModalContent.animate(contentFrames, {
+    duration: SETTINGS_MODAL_CONTENT_FADE_MS,
+    delay: opening ? 110 : 0,
+    easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+    fill: "forwards"
+  });
+  const labelAnimation = shellLabel?.animate(labelFrames, {
+    duration: SETTINGS_MODAL_ANIMATION_MS,
+    easing,
+    fill: "forwards"
+  });
+  const modalTitleAnimation = modalTitleFrames
+    ? settingsModalTitle.animate(modalTitleFrames, {
+        duration: SETTINGS_MODAL_ANIMATION_MS,
+        easing: "linear",
+        fill: "forwards"
+      })
+    : null;
+
+  const animationHandle = {
+    overlay: overlayAnimation,
+    shell: shellAnimation,
+    content: contentAnimation,
+    label: labelAnimation,
+    title: modalTitleAnimation
+  };
+  settingsModalAnimation = animationHandle;
+
+  if (!opening) {
+    settingsModalOriginRevealTimer = window.setTimeout(() => {
+      if (settingsModalAnimation !== animationHandle) return;
+      setSettingsOriginVisibility(false);
+      settingsModalOriginRevealTimer = null;
+    }, SETTINGS_MODAL_ANIMATION_MS - 70);
+  }
+
+  Promise.allSettled(
+    [
+      overlayAnimation.finished,
+      shellAnimation.finished,
+      contentAnimation.finished,
+      labelAnimation?.finished,
+      modalTitleAnimation?.finished
+    ].filter(Boolean)
+  ).then(() => {
+    if (settingsModalAnimation !== animationHandle) return;
+    if (settingsModalOriginRevealTimer) {
+      window.clearTimeout(settingsModalOriginRevealTimer);
+      settingsModalOriginRevealTimer = null;
+    }
+    settingsModalAnimation = null;
+    clearSettingsModalAnimationState();
+    onFinish?.();
+  });
+
+  return true;
+}
 
 function attachLiquidPointerTracking(element) {
   if (!element || element.dataset.liquidPointerBound === "1") return;
@@ -102,32 +545,82 @@ function attachLiquidPointerTracking(element) {
   }
 }
 
-function showSettingsModal() {
+function showSettingsModal(originEl = settingsBtn) {
   if (!settingsModal) return;
   if (settingsModalCloseTimer) {
     clearTimeout(settingsModalCloseTimer);
     settingsModalCloseTimer = null;
   }
-  settingsModal.classList.remove("hidden", "closing");
+  settingsModalOriginEl = originEl || settingsBtn || null;
+
+  if (!prefersReducedMotion() && settingsModalOriginEl) {
+    settingsModal.classList.add("settings-morphing", "settings-morph-open");
+  }
+  settingsModal.classList.remove("hidden", "closing", "settings-morph-close");
+
+  if (
+    !prefersReducedMotion() &&
+    animateSettingsModalMorph("open", settingsModalOriginEl, () => {
+      settingsModal.classList.remove("closing");
+    })
+  ) {
+    return;
+  }
+
+  clearSettingsModalAnimationState();
+}
+
+function showDonateModal() {
+  if (!donateModal) return;
+  if (donateModalCloseTimer) {
+    clearTimeout(donateModalCloseTimer);
+    donateModalCloseTimer = null;
+  }
+  donateModal.classList.remove("hidden", "closing");
 }
 
 function finishClosingSettingsModal() {
+  cancelSettingsModalAnimation();
   settingsModal.classList.remove("closing");
   settingsModal.classList.add("hidden");
   settingsModalCloseTimer = null;
 }
 
+function finishClosingDonateModal() {
+  donateModal.classList.remove("closing");
+  donateModal.classList.add("hidden");
+  donateModalCloseTimer = null;
+}
+
 function closeSettingsModal() {
   if (!settingsModal || settingsModal.classList.contains("hidden")) return;
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  if (prefersReducedMotion()) {
     finishClosingSettingsModal();
     return;
   }
   if (settingsModalCloseTimer) {
     clearTimeout(settingsModalCloseTimer);
   }
+  if (
+    animateSettingsModalMorph("close", settingsModalOriginEl || settingsBtn, finishClosingSettingsModal)
+  ) {
+    return;
+  }
   settingsModal.classList.add("closing");
   settingsModalCloseTimer = window.setTimeout(finishClosingSettingsModal, 180);
+}
+
+function closeDonateModal() {
+  if (!donateModal || donateModal.classList.contains("hidden")) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    finishClosingDonateModal();
+    return;
+  }
+  if (donateModalCloseTimer) {
+    clearTimeout(donateModalCloseTimer);
+  }
+  donateModal.classList.add("closing");
+  donateModalCloseTimer = window.setTimeout(finishClosingDonateModal, 180);
 }
 
 function getSettingsSnapshot() {
@@ -170,6 +663,7 @@ marked.setOptions({
 const SAFE_URI = /^(https?:|mailto:)/i;
 const MAX_SESSION_TITLE = 20;
 const DEFAULT_APP_TITLE = "Minecraft Wiki 助手";
+const VIEW_TRANSITION_MS = 520;
 
 function shortText(text, maxLen = MAX_SESSION_TITLE) {
   const t = (text || "").replace(/\s+/g, " ").trim();
@@ -223,6 +717,10 @@ function getCurrentSession() {
 }
 
 function getCurrentSessionTitle() {
+  if (currentView === "about") {
+    return "关于本项目";
+  }
+
   const current = getCurrentSession();
   if (!current) {
     return DEFAULT_APP_TITLE;
@@ -243,6 +741,97 @@ function syncAppTitle() {
   if (appTitle) {
     appTitle.textContent = nextTitle;
   }
+}
+
+function getChatViewElements() {
+  return [restartNotice, apiKeyNotice, chatList, inputBar].filter(Boolean);
+}
+
+function getViewElements(view) {
+  return view === "about" ? [aboutPage].filter(Boolean) : getChatViewElements();
+}
+
+function isElementShown(element) {
+  if (!element) return false;
+  return !element.classList.contains("panel-hidden") && !element.classList.contains("hidden");
+}
+
+function resetViewAnimationState(elements) {
+  elements.forEach((element) => {
+    element.classList.remove("view-enter", "view-enter-active", "view-exit", "view-exit-active");
+  });
+}
+
+function syncViewState() {
+  const showingAbout = currentView === "about";
+  chatList?.classList.toggle("panel-hidden", showingAbout);
+  inputBar?.classList.toggle("panel-hidden", showingAbout);
+  aboutPage?.classList.toggle("panel-hidden", !showingAbout);
+  apiKeyNotice?.classList.toggle("panel-hidden", showingAbout);
+  restartNotice?.classList.toggle("panel-hidden", showingAbout);
+
+  if (aboutToggleBtn) {
+    aboutToggleBtn.textContent = showingAbout ? "返回聊天" : "关于";
+    aboutToggleBtn.setAttribute("aria-pressed", showingAbout ? "true" : "false");
+  }
+
+  syncAppTitle();
+}
+
+function setCurrentView(view) {
+  const nextView = view === "about" ? "about" : "chat";
+  if (nextView === currentView || isViewTransitioning) {
+    return;
+  }
+
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    currentView = nextView;
+    syncViewState();
+    return;
+  }
+
+  const fromView = currentView;
+  const fromElements = getViewElements(fromView).filter(isElementShown);
+  const exitDuration = 220;
+  const enterDuration = VIEW_TRANSITION_MS - exitDuration;
+
+  isViewTransitioning = true;
+
+  if (viewTransitionTimer) {
+    window.clearTimeout(viewTransitionTimer);
+    viewTransitionTimer = null;
+  }
+
+  resetViewAnimationState(fromElements);
+  fromElements.forEach((element) => {
+    element.classList.add("view-exit");
+  });
+
+  requestAnimationFrame(() => {
+    fromElements.forEach((element) => element.classList.add("view-exit-active"));
+  });
+
+  viewTransitionTimer = window.setTimeout(() => {
+    resetViewAnimationState(fromElements);
+    currentView = nextView;
+    syncViewState();
+
+    const toElements = getViewElements(nextView).filter(isElementShown);
+    resetViewAnimationState(toElements);
+    toElements.forEach((element) => {
+      element.classList.add("view-enter");
+    });
+
+    requestAnimationFrame(() => {
+      toElements.forEach((element) => element.classList.add("view-enter-active"));
+    });
+
+    viewTransitionTimer = window.setTimeout(() => {
+      resetViewAnimationState(toElements);
+      isViewTransitioning = false;
+      viewTransitionTimer = null;
+    }, enterDuration);
+  }, exitDuration);
 }
 
 function deleteSession(sessionToDeleteId) {
@@ -267,6 +856,22 @@ function deleteSession(sessionToDeleteId) {
   const current = getCurrentSession();
   renderChatMessages(current?.messages || []);
   syncAppTitle();
+}
+
+function animateSessionDeletion(item, sessionToDeleteId) {
+  if (!item) {
+    deleteSession(sessionToDeleteId);
+    return;
+  }
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    deleteSession(sessionToDeleteId);
+    return;
+  }
+
+  item.classList.add("deleting");
+  window.setTimeout(() => {
+    deleteSession(sessionToDeleteId);
+  }, 220);
 }
 
 function renderAssistantFinalBubble(bubble, msg) {
@@ -331,6 +936,9 @@ function renderSessionList() {
       if (sessionId === s.id) return;
       animatedSessionId = s.id;
       sessionId = s.id;
+      if (currentView !== "chat") {
+        setCurrentView("chat");
+      }
       renderSessionList();
       animatedSessionId = null;
       renderChatMessages(s.messages || []);
@@ -347,7 +955,7 @@ function renderSessionList() {
     attachLiquidPointerTracking(deleteBtn);
     deleteBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      deleteSession(s.id);
+      animateSessionDeletion(item, s.id);
     });
 
     item.appendChild(titleBtn);
@@ -373,7 +981,7 @@ function updateApiKeyNotice() {
   }
 }
 apiKeyNoticeLink.addEventListener("click", () => {
-  openSettings();
+  openSettings(apiKeyNoticeLink);
   setTimeout(() => cfgApiKey?.focus?.(), 50);
 });
 function updateNearBottom() {
@@ -799,7 +1407,6 @@ function renderReferences(evidences) {
       const link = document.createElement("a");
       link.textContent = titleText;
       link.setAttribute("href", url);
-      link.setAttribute("target", "_blank");
       link.setAttribute("rel", "noreferrer noopener");
       heading.appendChild(link);
     } else {
@@ -968,6 +1575,17 @@ async function sendMessage() {
   let finished = false;
   let retried = false;
   let es = null;
+  let streamedAnswerText = "";
+
+  const ensureStreamingBubble = () => {
+    if (!assistantMsg.bubble.classList.contains("thinking")) {
+      return;
+    }
+    animateThinkingToFinalBubble(assistantMsg.bubble, () => {
+      removeThinking(assistantMsg.bubble);
+      assistantMsg.bubble.textContent = streamedAnswerText;
+    });
+  };
 
   const startStream = () => {
     es = new EventSource(streamUrl);
@@ -976,21 +1594,46 @@ async function sendMessage() {
       try {
         const data = JSON.parse(ev.data);
         const nextText = data.text ?? "";
-        assistantMessage.text = nextText || assistantMessage.text;
+        if (!streamedAnswerText) {
+          assistantMessage.text = nextText || assistantMessage.text;
+        }
         activeSession.updatedAt = Date.now();
         saveSessions();
 
         if (sessionId !== requestSessionId) {
           return;
         }
-        if (assistantMsg.bubble.classList.contains("thinking")) {
+        if (!streamedAnswerText && assistantMsg.bubble.classList.contains("thinking")) {
           if (nextText.trim() !== "") {
             assistantMsg.bubble.dataset.thinkingText = nextText;
             assistantMsg.bubble.textContent = nextText;
           }
-        } else {
+        } else if (!streamedAnswerText) {
           assistantMsg.bubble.textContent = nextText;
         }
+        scrollToBottomIfNeeded();
+      } catch (_) {}
+    });
+
+    es.addEventListener("answer_delta", (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        const delta = data.delta ?? "";
+        if (!delta) {
+          return;
+        }
+
+        streamedAnswerText += delta;
+        assistantMessage.text = streamedAnswerText;
+        activeSession.updatedAt = Date.now();
+        saveSessions();
+
+        if (sessionId !== requestSessionId) {
+          return;
+        }
+
+        ensureStreamingBubble();
+        assistantMsg.bubble.textContent = streamedAnswerText;
         scrollToBottomIfNeeded();
       } catch (_) {}
     });
@@ -999,7 +1642,7 @@ async function sendMessage() {
       try {
         const data = JSON.parse(ev.data);
         assistantMessage.status = "normal";
-        assistantMessage.text = data.answer || "(无回答)";
+        assistantMessage.text = data.answer || streamedAnswerText || "(无回答)";
         assistantMessage.evidences_for_llm = data.evidences_for_llm || [];
         assistantMessage.token_usage = data.token_usage || {};
         assistantMessage.timing_ms = data.timing_ms || {};
@@ -1007,15 +1650,14 @@ async function sendMessage() {
         saveSessions();
 
         if (sessionId === requestSessionId) {
-          const streamedText = assistantMsg.bubble.dataset.thinkingText || "";
-          animateThinkingToFinalBubble(assistantMsg.bubble, () => {
-            removeThinking(assistantMsg.bubble);
-            assistantMsg.bubble.textContent = streamedText;
-          });
-          progressivelyRevealAssistantBubble(assistantMsg.bubble, assistantMessage.text)
-            .then(() => {
+          if (assistantMsg.bubble.classList.contains("thinking")) {
+            animateThinkingToFinalBubble(assistantMsg.bubble, () => {
+              removeThinking(assistantMsg.bubble);
               renderAssistantFinalBubble(assistantMsg.bubble, assistantMessage);
             });
+          } else {
+            renderAssistantFinalBubble(assistantMsg.bubble, assistantMessage);
+          }
         }
 
         finished = true;
@@ -1140,7 +1782,7 @@ function updateInputBarLayout(lineHeight = null) {
   inputBar.classList.toggle("expanded", hasContent || isFocused || lines > 1);
 }
 
-async function openSettings() {
+async function openSettings(sourceEl = settingsBtn) {
   try {
     const cfg = await fetchJsonWithRetry(`${API_BASE}/api/config`, {}, 8, 500);
 
@@ -1157,12 +1799,26 @@ async function openSettings() {
     cfgFontSize.value = cfg.font_size ?? 14;
     lastLoadedSettingsSnapshot = getSettingsSnapshot();
 
-    showSettingsModal();
+    showSettingsModal(sourceEl);
   } catch (err) {
     setStatus("Error");
   }
 }
-settingsBtn.addEventListener("click", openSettings);
+settingsBtn.addEventListener("click", () => openSettings(settingsBtn));
+aboutToggleBtn?.addEventListener("click", () => {
+  setCurrentView(currentView === "about" ? "chat" : "about");
+});
+donatePreviewBtn?.addEventListener("click", () => {
+  showDonateModal();
+});
+donateCloseBtn?.addEventListener("click", () => {
+  closeDonateModal();
+});
+deepseekApiKeyLink?.addEventListener("click", async () => {
+  try {
+    await open("https://platform.deepseek.com/api_keys");
+  } catch (_) {}
+});
 
 settingsCancel.addEventListener("click", () => {
   closeSettingsModal();
@@ -1174,7 +1830,17 @@ settingsModal?.addEventListener("click", (event) => {
   }
 });
 
+donateModal?.addEventListener("click", (event) => {
+  if (event.target === donateModal) {
+    closeDonateModal();
+  }
+});
+
 settingsModalContent?.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+donateModalContent?.addEventListener("click", (event) => {
   event.stopPropagation();
 });
 
@@ -1233,6 +1899,9 @@ restartAppBtn?.addEventListener("click", async () => {
 
 newSessionBtn?.addEventListener("click", () => {
   startDraftSession();
+  if (currentView !== "chat") {
+    setCurrentView("chat");
+  }
   renderSessionList();
   renderChatMessages([]);
   syncAppTitle();
@@ -1265,10 +1934,12 @@ window.addEventListener("DOMContentLoaded", () => {
   document
     .querySelectorAll(".modal-content, .form input, .form select")
     .forEach(attachLiquidPointerTracking);
+  document.querySelectorAll(".about-card").forEach(attachLiquidPointerTracking);
   loadSessions();
   renderSessionList();
   const current = getCurrentSession();
   renderChatMessages(current?.messages || []);
+  syncViewState();
   syncAppTitle();
   autoResizeInput();
 

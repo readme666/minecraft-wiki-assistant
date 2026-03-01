@@ -7,10 +7,12 @@ if any(a in ("-h", "--help") for a in sys.argv[1:]):
     )
     raise SystemExit(0)
 import json
+import logging
 import os
 import threading
 _INIT_LOCK = threading.Lock()
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
@@ -18,7 +20,9 @@ from typing import Any, Callable, Dict, List, Tuple, Optional
 import faiss
 import traceback
 import requests
+from requests.adapters import HTTPAdapter
 from sentence_transformers import SentenceTransformer
+from config import logs_dir
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_DIR = PROJECT_ROOT / "pyserver" / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
 model = SentenceTransformer(str(MODEL_DIR))
@@ -28,6 +32,9 @@ EVIDENCE_FOR_LLM = 30
 EVIDENCE_TEXT_MAX = 600          # 普通段落
 TRADE_EVIDENCE_TEXT_MAX = 2800   # 交易表段落（关键）
 SECTION2IDXS: Dict[Tuple[str, int], List[int]] = {}
+PIPELINE_LOGGER = logging.getLogger("pipeline")
+_DEEPSEEK_SESSION: Optional[requests.Session] = None
+_DEEPSEEK_SESSION_LOCK = threading.Lock()
 # ============================================================
 # Token Estimate (DeepSeek rough)
 # ============================================================
@@ -54,39 +61,101 @@ from typing import Dict, List, Optional
 
 _TRADE_LINE_RE = re.compile(r"(?m)^\s*交易\s*:\s*")
 _TRADE_SECTION_HINT_RE = re.compile(r"(交易|trades?)", re.I)
+_STRUCTURED_SEGMENT_RE = re.compile(r"[^|:\n]+[:：][^|]+")
+_STRUCTURED_LINE_SPLIT_RE = re.compile(r"\s*\|\s*")
+_TRADE_FIELD_HINT_RE = re.compile(
+    r"(村民收购的物品|村民出售的物品|价格乘数|失效前可交易次数|村民获得的经验值|交易次序|概率|wantQuant|want=|giveQuant|give=|lvl=|maxTrades|xpGain)",
+    re.I,
+)
+
+
+def _is_structured_kv_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _TRADE_LINE_RE.match(s):
+        return True
+    if "|" not in s:
+        return False
+    parts = [p.strip() for p in _STRUCTURED_LINE_SPLIT_RE.split(s) if p.strip()]
+    if len(parts) < 2:
+        return False
+    score = 0
+    for part in parts:
+        if _STRUCTURED_SEGMENT_RE.fullmatch(part):
+            score += 1
+    return score >= 2
+
+
+def _is_trade_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _TRADE_LINE_RE.match(s):
+        return True
+    return _is_structured_kv_line(s) and bool(_TRADE_FIELD_HINT_RE.search(s))
+
+
+def _count_trade_lines(text: str) -> int:
+    return sum(1 for ln in (text or "").splitlines() if _is_trade_line(ln))
+
+
+def _has_trade_lines(text: str, min_lines: int = 1) -> bool:
+    return _count_trade_lines(text) >= min_lines
+
+
+def _is_trade_section_hint(text: str) -> bool:
+    return bool(_TRADE_SECTION_HINT_RE.search(text or ""))
+
+
+def _find_trade_anchor_pos(text: str) -> Optional[int]:
+    best: Optional[int] = None
+    old = _TRADE_LINE_RE.search(text or "")
+    if old is not None:
+        best = old.start()
+
+    cursor = 0
+    for raw in (text or "").splitlines(True):
+        line = raw.rstrip("\r\n")
+        stripped = line.strip()
+        if stripped and _is_trade_line(stripped):
+            pos = cursor + max(0, line.find(stripped))
+            if best is None or pos < best:
+                best = pos
+                break
+        cursor += len(raw)
+    return best
 
 def _is_trade_evidence(ev: Dict) -> bool:
     tx = (ev.get("text") or "")
     sp = (ev.get("section_path") or ev.get("section") or "")
     st = (ev.get("section_title") or "")
-    # 1) 文本里有多条交易行
-    if _TRADE_LINE_RE.search(tx):
+    if _has_trade_lines(tx):
         return True
-    # 2) section 提示为“交易”
-    if _TRADE_SECTION_HINT_RE.search(sp) or _TRADE_SECTION_HINT_RE.search(st):
+    if _is_trade_section_hint(sp) or _is_trade_section_hint(st):
         return True
     return False
 
 def _truncate_trade_text(tx: str, limit: int) -> str:
     """
     交易证据截断策略：
-    - 尽量从第一条“交易:”开始保留（跳过标题/模板/导言）
+    - 尽量从第一条交易结构行开始保留（兼容旧“交易:”与新结构化表格行）
     - 保留开头少量信息（标题/小节），再拼交易主体
     """
     if len(tx) <= limit:
         return tx
 
-    m = _TRADE_LINE_RE.search(tx)
-    if not m:
+    anchor = _find_trade_anchor_pos(tx)
+    if anchor is None:
         return tx[:limit] + "…"
 
     # 保留头部（标题/小节）最多 180 字符
-    head = tx[:m.start()]
+    head = tx[:anchor]
     head = head.strip()
     if len(head) > 180:
         head = head[:180].rstrip() + "\n…"
 
-    body = tx[m.start():]
+    body = tx[anchor:]
     # 让主体拿到尽可能多空间
     remain = max(0, limit - len(head) - 1)
     if remain <= 0:
@@ -209,9 +278,63 @@ def format_cost_stats_dict() -> dict:
         "output": float(cost["output"]),
         "total_expected": float(cost["total_expected"]),
     }
+
+
+def _timed_call(
+    timings: Dict[str, int],
+    name: str,
+    fn: Callable[..., Any],
+    *args,
+    **kwargs,
+) -> Any:
+    t0 = time.perf_counter()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        timings[name] = int((time.perf_counter() - t0) * 1000)
+
+
+def _set_prefixed_timing(timings: Optional[Dict[str, int]], prefix: str, name: str, elapsed_ms: int) -> None:
+    if timings is None:
+        return
+    key = f"{prefix}{name}" if prefix else name
+    timings[key] = int(elapsed_ms)
+
+
+def _log_pipeline_timings(question: str, timings: Dict[str, int]) -> None:
+    total_ms = int(timings.get("pipeline_total") or sum(v for k, v in timings.items() if isinstance(v, int) and k != "pipeline_total"))
+    ordered = {k: timings[k] for k in sorted(timings.keys())}
+    line = "pipeline_timing question=%s total_ms=%s breakdown=%s" % (
+        question[:120],
+        total_ms,
+        json.dumps(ordered, ensure_ascii=False),
+    )
+    PIPELINE_LOGGER.info(line)
+    try:
+        log_path = logs_dir() / "server.log"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8", newline="\n") as f:
+            f.write(f"{ts} [INFO] pipeline: {line}\n")
+    except Exception:
+        pass
 # ============================================================
 # Utils: 标题优先召回
 # ============================================================
+def _get_deepseek_session() -> requests.Session:
+    global _DEEPSEEK_SESSION
+    if _DEEPSEEK_SESSION is not None:
+        return _DEEPSEEK_SESSION
+
+    with _DEEPSEEK_SESSION_LOCK:
+        if _DEEPSEEK_SESSION is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            _DEEPSEEK_SESSION = session
+    return _DEEPSEEK_SESSION
+
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[\s\-\_·•,，。.!！？x（）()\[\]【】{}<>《》:：;；\"'“”‘’/\\]+", "", s)
@@ -505,6 +628,7 @@ def enhance_sections_inplace(
 ) -> List[Dict]:
     if not evidences:
         return evidences
+    init_once()
 
     # 1) 收集需要增强的 key（只增强“交易”等表格段）
     keys = []
@@ -513,9 +637,13 @@ def enhance_sections_inplace(
         u = ev.get("url")
         si = ev.get("section_index")
         st = (ev.get("section_title") or "") + " " + (ev.get("section_path") or "")
+        tx = (ev.get("text") or "")
         if not u or si is None:
             continue
-        if only_if_section_contains and (only_if_section_contains not in st):
+        if only_if_section_contains:
+            if (only_if_section_contains not in st) and not _is_trade_section_hint(st) and not _has_trade_lines(tx):
+                continue
+        elif not (_is_trade_section_hint(st) or _has_trade_lines(tx)):
             continue
         key = (u, int(si))
         if key in seen:
@@ -526,24 +654,19 @@ def enhance_sections_inplace(
     if not keys:
         return evidences
 
-    target_keys = set(keys)
+    _ = meta_all_path  # keep signature stable for callers
 
     # 2) 从 meta_all 把这些 section 的所有 chunk 收齐
-    grouped = defaultdict(list)
-    with meta_all_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                m = json.loads(line)
-            except Exception:
-                continue
-            key = (m.get("url"), m.get("section_index"))
-            if key in target_keys:
-                grouped[key].append(m)
+    grouped = {}
+    for key in keys:
+        idxs = SECTION2IDXS.get(key) or []
+        if not idxs:
+            continue
+        grouped[key] = [METAS[idx] for idx in idxs if 0 <= idx < len(METAS)]
 
     # 3) 生成每个 section 的聚合文本
     agg_text = {}
     for key, items in grouped.items():
-        items.sort(key=lambda x: int(x.get("chunk_index", 0)))
         lines = []
         for m in items:
             for ln in (m.get("text") or "").splitlines():
@@ -553,8 +676,9 @@ def enhance_sections_inplace(
                     continue
                 lines.append(ln)
 
-        # 如果是交易段，只保留交易行（避免噪声）
-        
+        trade_lines = [ln for ln in lines if _is_trade_line(ln)]
+        if trade_lines:
+            lines = trade_lines
 
         joined = "\n".join(lines)
         if max_chars > 0 and len(joined) > max_chars:
@@ -629,8 +753,9 @@ def aggregate_sections(
                     continue
                 lines.append(ln)
         sec_title = (m0.get("section_title") or "")
-        if ("交易" in sec_title) or (("section_path" in m0) and ("交易" in (m0.get("section_path") or ""))):
-            trade_lines = [ln for ln in lines if ln.startswith("交易:")]
+        sec_path = (m0.get("section_path") or "")
+        if _is_trade_section_hint(sec_title) or _is_trade_section_hint(sec_path):
+            trade_lines = [ln for ln in lines if _is_trade_line(ln)]
             if trade_lines:
                 lines = trade_lines
         joined = "\n".join(lines)
@@ -656,7 +781,7 @@ def aggregate_sections(
     return out
 
 def _test_aggregate_sections_armorer_trade(meta_all_path: Path) -> None:
-    # simple regression check: aggregated text should include Master trade line
+    # simple regression check: aggregated text should preserve trade-focused content
     chunks = []
     with meta_all_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -671,8 +796,8 @@ def _test_aggregate_sections_armorer_trade(meta_all_path: Path) -> None:
     agg = aggregate_sections(chunks, meta_all_path, max_groups=1, max_chars=2000)
     if not agg:
         raise AssertionError("aggregate_sections: no output for 盔甲匠/交易")
-    if "lvl=Master" not in (agg[0].get("text") or ""):
-        raise AssertionError("aggregate_sections: missing lvl=Master in aggregated text")
+    if not _has_trade_lines(agg[0].get("text") or ""):
+        raise AssertionError("aggregate_sections: missing trade lines in aggregated text")
 def build_title_index(meta: List[Dict]) -> Tuple[Dict[str, List[int]], List[Tuple[str, str]]]:
     title2idx = defaultdict(list)
     norm_titles: List[Tuple[str, str]] = []
@@ -842,7 +967,7 @@ def expand_evidence_context(
     meta_path: 指向 meta_all.jsonl（JSONL）
     对每条 evidence，按 (url, section_index) 找到同 section 的 chunks 列表：
     - 普通段：左右 window 拼接
-    - 交易段：从当前 chunk 往后扫，直到拿够 trade_min_lines 条“交易:”行或到 trade_max_scan
+    - 交易段：从当前 chunk 往后扫，直到拿够 trade_min_lines 条交易结构行或到 trade_max_scan
     """
     import json
     from collections import defaultdict
@@ -917,7 +1042,7 @@ def expand_evidence_context(
             continue
 
         sec_title = (ev.get("section_title") or "") + " " + (ev.get("section_path") or "")
-        is_trade = ("交易" in sec_title)
+        is_trade = _is_trade_section_hint(sec_title) or _has_trade_lines(ev.get("text") or "")
 
         if is_trade:
             texts = []
@@ -930,8 +1055,7 @@ def expand_evidence_context(
                 if not t:
                     continue
 
-                # 统计“交易:”行（更宽松）
-                trade_lines += sum(1 for ln in t.splitlines() if "交易:" in ln)
+                trade_lines += _count_trade_lines(t)
 
                 # 控总长度
                 if total_chars + len(t) + 1 > max_chars:
@@ -1018,7 +1142,7 @@ def expand_evidence_context_fast(
             out.append(ev); continue
 
         sec_title = (ev.get("section_title") or "") + " " + (ev.get("section_path") or "")
-        is_trade = ("交易" in sec_title)
+        is_trade = _is_trade_section_hint(sec_title) or _has_trade_lines(ev.get("text") or "")
 
         if is_trade:
             texts = []
@@ -1029,7 +1153,7 @@ def expand_evidence_context_fast(
                 t = (METAS[midx].get("text") or "").strip()
                 if not t:
                     continue
-                trade_lines += sum(1 for ln in t.splitlines() if "交易:" in ln)
+                trade_lines += _count_trade_lines(t)
                 limit = trade_max_chars if (trade_max_chars is not None) else max_chars
 
                 if total_chars + len(t) + 1 > limit:
@@ -1278,12 +1402,16 @@ def _call_deepseek_json(
         "temperature": 0.0,
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp = _get_deepseek_session().post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     s = data["choices"][0]["message"]["content"].strip()
     _add_token_usage(call_name, system, user, s)
     return json.loads(s)
+
+
+def _default_classification() -> Dict[str, Any]:
+    return {"type": "fact", "version_sensitive": True}
 # ============================================================
 # Deepseek：分类（类型/版本敏感）
 # ============================================================
@@ -1291,6 +1419,12 @@ def classify_question(question: str, *, config: Dict[str, Any]) -> Dict:
     """
     return e.g. {"type": "fact|howto", "version_sensitive": true|false}
     """
+    analyzed = analyze_question(question, config=config)
+    return {
+        "type": analyzed.get("type", "fact"),
+        "version_sensitive": bool(analyzed.get("version_sensitive", True)),
+    }
+
     if not (config.get("api_key") or "").strip():
         return {"type": "fact", "version_sensitive": True}
 
@@ -1343,7 +1477,142 @@ STOP_ANCHORS = {
     "哪个好",
 }
 #完善anchor过滤，避免输出一些无意义的锚点词，如“我的世界”“应该”“怎么”等等，这些词在大多数问题里都可能出现，但并不适合作为检索锚点。
+def _fallback_query_plan(question: str) -> Dict[str, Any]:
+    ench = re.findall(r"[^\s锛屻€傦紒锛焫锛堬級()\[\]銆愩€憑}<>銆娿€?锛?锛沑\"'鈥溾€濃€樷€?\\]{1,8}[IVX0-9]+", question)
+    anchors = [re.sub(r"[IVX0-9]+$", "", x) for x in ench]
+    anchors = [a for a in anchors if a and a.lower() not in STOP_ANCHORS]
+    anchors = list(dict.fromkeys(anchors))[:6]
+    rq = " ".join(anchors) if anchors else question
+    return {
+        "anchors": anchors,
+        "rewrite_query": rq,
+        "subquestions": [],
+        "detail_level": "normal",
+        "need_version": True,
+    }
+
+
+def _normalize_query_plan(raw: Optional[Dict[str, Any]], question: str, default_need_version: bool) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {
+            "anchors": [],
+            "rewrite_query": question,
+            "subquestions": [],
+            "detail_level": "normal",
+            "need_version": bool(default_need_version),
+        }
+
+    anchors = raw.get("anchors") or []
+    if not isinstance(anchors, list):
+        anchors = []
+    anchors = [str(x).strip() for x in anchors if str(x).strip()]
+
+    cleaned: List[str] = []
+    seen = set()
+    for a in anchors:
+        al = a.lower()
+        if al in STOP_ANCHORS:
+            continue
+        if len(a) <= 1:
+            continue
+        if a in seen:
+            continue
+        seen.add(a)
+        cleaned.append(a)
+        if len(cleaned) >= 8:
+            break
+
+    rq = (raw.get("rewrite_query") or "").strip()
+    if not rq:
+        rq = " ".join(cleaned) if cleaned else question
+
+    subs = raw.get("subquestions") or []
+    if not isinstance(subs, list):
+        subs = []
+    subs = [str(x).strip() for x in subs if str(x).strip()][:3]
+
+    dl = raw.get("detail_level")
+    if dl not in ("brief", "normal", "detailed"):
+        dl = "normal"
+
+    nv = bool(raw.get("need_version", default_need_version))
+    return {
+        "anchors": cleaned,
+        "rewrite_query": rq,
+        "subquestions": subs,
+        "detail_level": dl,
+        "need_version": nv,
+    }
+
+
+def analyze_question(question: str, *, config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Single LLM call that returns both intent classification and retrieval planning.
+    """
+    if not (config.get("api_key") or "").strip():
+        out = _default_classification()
+        out.update(_fallback_query_plan(question))
+        return out
+
+    system = (
+        "你是Minecraft问答系统的问题分析与检索计划器，只输出严格JSON，不要任何多余文字。\n"
+        "输出格式：\n"
+        "{"
+        '"intent":"fact|howto|why|overview",'
+        '"version_sensitive":true|false,'
+        '"anchors":["..."],'
+        '"rewrite_query":"...",'
+        '"subquestions":["..."],'
+        '"detail_level":"brief|normal|detailed",'
+        '"need_version":true|false'
+        "}\n"
+        "intent含义与分类标准：\n"
+        "- fact：具体属性、配方、生成条件、数值概率、指令等单点事实。\n"
+        "- howto：明确要求连贯步骤、搭建流程、自动化设计或复杂操作流程。\n"
+        "- why：原因、原理、故障排查、机制差异、物品或机制对比。\n"
+        "- overview：大全、盘点、种类列表、宏观总结。\n"
+        "规则：\n"
+        "1) 含有“怎么提高/降低/增加/获得”等词的非建造类问题，通常应判为 fact 或 why，不要误判成 howto。\n"
+        "2) 问“为什么/区别/原理”的，优先判为 why。\n"
+        "3) 问“大全/所有/哪些/盘点”的，优先判为 overview。\n"
+        "4) intent 只能是 fact、howto、why、overview 之一。\n"
+        "5) version_sensitive 表示该问题是否需要区分 Java版/基岩版。\n"
+        "6) anchors 只抽取适合 Wiki 检索的词条锚点，优先词条名、魔咒名、物品名、机制名，不要抽空泛词。\n"
+        "7) anchors 输出 3 到 8 个，按重要性排序；如果不够，可以少于 3 个。\n"
+        "8) rewrite_query 用 anchors 组织成短检索串，不要写成长句。\n"
+        "9) subquestions 最多 3 条，只保留回答不可缺少的前置概念、兼容性或适用范围问题。\n"
+        "10) detail_level 默认 normal。\n"
+        "11) need_version 表示生成答案时是否应主动强调版本差异；不确定时可与 version_sensitive 保持一致。\n"
+        "12) 只做分析与规划，不要回答问题本身。"
+    )
+    user = f"用户问题：{question}"
+
+    try:
+        raw = _call_deepseek_json(system, user, config=config, timeout=25, call_name="analyze_question")
+    except Exception:
+        raw = None
+
+    out = _default_classification()
+    if isinstance(raw, dict):
+        intent = raw.get("intent")
+        if intent in ("fact", "howto", "why", "overview"):
+            out["type"] = intent
+        out["version_sensitive"] = bool(raw.get("version_sensitive", True))
+
+    out.update(_normalize_query_plan(raw, question, out["version_sensitive"]))
+    return out
+
+
 def extract_query_plan(question: str, mode: str, *, config: Dict[str, Any]) -> Dict:
+    analyzed = analyze_question(question, config=config)
+    return {
+        "anchors": analyzed.get("anchors", []),
+        "rewrite_query": analyzed.get("rewrite_query", question),
+        "subquestions": analyzed.get("subquestions", []),
+        "detail_level": analyzed.get("detail_level", "normal"),
+        "need_version": bool(analyzed.get("need_version", analyzed.get("version_sensitive", True))),
+    }
+
     if not (config.get("api_key") or "").strip():
         ench = re.findall(r"[^\s，。！？x（）()\[\]【】{}<>《》:：;；\"'“”‘’/\\]{1,8}[IVX0-9]+", question)
         anchors = [re.sub(r"[IVX0-9]+$", "", x) for x in ench]
@@ -1619,8 +1888,13 @@ def retrieve_with_plan(
     plan: Dict,
     anchors: Optional[List[str]] = None,
     forced_ids: Optional[List[int]] = None,
+    timing_out: Optional[Dict[str, int]] = None,
+    timing_prefix: str = "",
 ) -> List[Dict]:
+    _t_retrieve_total = time.perf_counter()
+    _t0 = time.perf_counter()
     init_once()
+    _set_prefixed_timing(timing_out, timing_prefix, "init_once", int((time.perf_counter() - _t0) * 1000))
     trace = None
     def _parse_trace_targets(raw) -> List[Dict]:
         items: List[Dict] = []
@@ -1721,7 +1995,9 @@ def retrieve_with_plan(
     if max_facets > 0:
         facet_queries = facet_queries[:max_facets]
     main_query = facet_queries[0] if facet_queries else query
+    _t0 = time.perf_counter()
     qv = MODEL.encode([main_query], normalize_embeddings=True).astype("float32")
+    _set_prefixed_timing(timing_out, timing_prefix, "query_encode", int((time.perf_counter() - _t0) * 1000))
     trace = None
     if trace_retrieval:
         targets_dict = {}
@@ -1767,6 +2043,8 @@ def retrieve_with_plan(
     trace_out_path = plan.get("trace_out") if trace_retrieval else None
     if trace_retrieval and trace is not None:
         trace["forced_cnt"] = len(forced_ids)
+    _t_title_prior = time.perf_counter()
+    _faiss_search_ms = 0
     if use_title_prior and parallel_title_prior:
         with ThreadPoolExecutor(max_workers=2) as ex:
             if anchors:
@@ -1789,7 +2067,9 @@ def retrieve_with_plan(
                 k_chunks_per_page=int(plan.get("k_chunks_per_page", 6)),
                 k_total_chunks=int(plan.get("k_title_total", 60)),
             )
+            _t_faiss = time.perf_counter()
             scores, ids = INDEX.search(qv, vec_k)
+            _faiss_search_ms = int((time.perf_counter() - _t_faiss) * 1000)
             if anchor_fut is not None:
                 try:
                     anchor_ids = anchor_fut.result()
@@ -1822,7 +2102,12 @@ def retrieve_with_plan(
                 k_chunks_per_page=int(plan.get("k_chunks_per_page", 6)),
                 k_total_chunks=int(plan.get("k_title_total", 60)),
             )
+        _t_faiss = time.perf_counter()
         scores, ids = INDEX.search(qv, vec_k)
+        _faiss_search_ms = int((time.perf_counter() - _t_faiss) * 1000)
+    _set_prefixed_timing(timing_out, timing_prefix, "faiss_search", _faiss_search_ms)
+    _set_prefixed_timing(timing_out, timing_prefix, "title_prior", int((time.perf_counter() - _t_title_prior) * 1000))
+    _t_page_rerank = time.perf_counter()
     if use_title_prior:
         # ???anchor ??
         raw_prior_ids: List[int] = []
@@ -1914,17 +2199,20 @@ def retrieve_with_plan(
                     trace["eval_target_title"] = (METAS[eval_target_id].get("title") or "").strip()
                 else:
                     trace["eval_target_title"] = None
+    _set_prefixed_timing(timing_out, timing_prefix, "page_rerank", int((time.perf_counter() - _t_page_rerank) * 1000))
     # ???????????
     if scores is None or ids is None:
         return []
     facet_results: List[Tuple[str, List[int], List[float]]] = [
         (main_query, ids[0].tolist(), scores[0].tolist())
     ]
+    _t_facet = time.perf_counter()
     if enable_facet_retrieval and len(facet_queries) > 1:
         for fq in facet_queries[1:]:
             qv_f = MODEL.encode([fq], normalize_embeddings=True).astype("float32")
             sc_f, id_f = INDEX.search(qv_f, vec_k)
             facet_results.append((fq, id_f[0].tolist(), sc_f[0].tolist()))
+    _set_prefixed_timing(timing_out, timing_prefix, "facet_search", int((time.perf_counter() - _t_facet) * 1000))
     if trace_retrieval:
         for fq, f_ids, f_scores in facet_results:
             rank_map = {idx: r + 1 for r, idx in enumerate(f_ids)}
@@ -2177,6 +2465,7 @@ def retrieve_with_plan(
         trace["dbg_top_m_to_use"] = top_m_to_use
         trace["dbg_global_rerank_cap"] = global_rerank_cap
     global_debug = {} if trace_retrieval else None
+    _t_global_rerank = time.perf_counter()
     if enable_global_rerank and remaining_candidates and need_n > 0:
         reranked_remaining, global_score_map = global_rerank_candidates(
             main_query,
@@ -2246,6 +2535,7 @@ def retrieve_with_plan(
             reranked_remaining,
             key=lambda x: (-final_scores.get(x, 0.0), order_map.get(x, 0)),
         )
+    _set_prefixed_timing(timing_out, timing_prefix, "global_rerank", int((time.perf_counter() - _t_global_rerank) * 1000))
     if trace_retrieval and trace is not None:
         trace["global_top_m_used"] = top_m_to_use
         trace["remaining_candidates_cnt"] = len(remaining_candidates)
@@ -2290,6 +2580,7 @@ def retrieve_with_plan(
             trace["targets"][tkey]["global_score"] = global_score_map.get(t)
             trace["targets"][tkey]["global_in"] = t in global_rank
             trace["targets"][tkey]["global_rank"] = global_rank.get(t)
+    _t_merge = time.perf_counter()
     # (1) reranked remaining (prior + vec)
     for idx in reranked_remaining:
         if len(merged) >= top_k:
@@ -2532,6 +2823,7 @@ def retrieve_with_plan(
                 trace["warn_underfilled"] = True
             else:
                 trace["warn_underfilled"] = False
+    _set_prefixed_timing(timing_out, timing_prefix, "merge_results", int((time.perf_counter() - _t_merge) * 1000))
     prior_score_map: Dict[int, float] = {}
     for idx in prior_ids + forced_ids:
         if idx is None or idx < 0 or idx >= len(METAS):
@@ -2573,6 +2865,7 @@ def retrieve_with_plan(
                 "text": m.get("text", ""),
             }
         )
+    _t_finalize = time.perf_counter()
     if trace_retrieval and trace is not None:
         trace["final_evidence_cnt"] = len(results)
         id2idx = None
@@ -2658,6 +2951,8 @@ def retrieve_with_plan(
             os.replace(str(tmp_path), str(out_path))
         else:
             print(json.dumps(trace, ensure_ascii=False), file=sys.stderr)
+    _set_prefixed_timing(timing_out, timing_prefix, "finalize_results", int((time.perf_counter() - _t_finalize) * 1000))
+    _set_prefixed_timing(timing_out, timing_prefix, "total", int((time.perf_counter() - _t_retrieve_total) * 1000))
     return results
 # ============================================================
 # LLM: 回答
@@ -2741,7 +3036,33 @@ def build_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 from typing import List, Dict, Any
 
-def call_llm(messages: List[Dict], *, config: Dict[str, Any]) -> str:
+
+def _iter_deepseek_stream(response):
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line or line.startswith(":") or not line.startswith("data:"):
+            continue
+
+        data = line[5:].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            break
+
+        try:
+            yield json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+
+def call_llm(
+    messages: List[Dict],
+    *,
+    config: Dict[str, Any],
+    stream_cb: Optional[Callable[[str], None]] = None,
+) -> str:
     api_base = (config.get("api_base") or "https://api.deepseek.com").strip()
     api_key = (config.get("api_key") or "").strip()
     # 你现在 config 里默认是 deepseek-chat；如果你想用 reasoner，就把 config 默认改掉
@@ -2751,13 +3072,33 @@ def call_llm(messages: List[Dict], *, config: Dict[str, Any]) -> str:
         raise RuntimeError("缺少 API Key：请在设置中填写（不会写入磁盘）")
 
     url = f"{api_base.rstrip('/')}/v1/chat/completions"
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    use_stream = stream_cb is not None
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "stream": use_stream}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    out = data["choices"][0]["message"]["content"].strip()
+    if use_stream:
+        chunks: List[str] = []
+        with _get_deepseek_session().post(url, headers=headers, json=payload, timeout=60, stream=True) as resp:
+            resp.raise_for_status()
+            for event in _iter_deepseek_stream(resp):
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if not piece:
+                    continue
+                chunks.append(piece)
+                try:
+                    stream_cb(piece)
+                except Exception:
+                    pass
+        out = "".join(chunks).strip()
+    else:
+        resp = _get_deepseek_session().post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        out = data["choices"][0]["message"]["content"].strip()
 
     sys_txt = "\n".join([m["content"] for m in messages if m.get("role") == "system"])
     user_txt = "\n".join([m["content"] for m in messages if m.get("role") == "user"])
@@ -2780,6 +3121,7 @@ def pipeline(
     max_evidences: Optional[int] = None,          # 默认 None -> 用 EVIDENCE_FOR_LLM
     max_chars_per_evidence: int = 600,
     progress_cb: Optional[Callable[[str], None]] = None,
+    answer_stream_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     单一真相：把 main() 的核心流程搬到这里。
@@ -2787,6 +3129,9 @@ def pipeline(
     """
     trace_obj: Optional[Dict[str, Any]] = {} if trace else None
     used_max_evidences = int(max_evidences) if max_evidences is not None else int(EVIDENCE_FOR_LLM)
+    pipeline_timings: Dict[str, int] = {}
+    pipeline_total_t0 = time.perf_counter()
+    debug_mode = bool(config.get("debug_mode", False))
     def _progress(msg: str):
         if progress_cb:
             try:
@@ -2803,26 +3148,33 @@ def pipeline(
     if not INDEX_PATH.exists() or not META_PATH.exists():
         raise RuntimeError("索引文件不存在，请先运行 03_build_index.py")
 
-    init_once()
-    reset_token_stats()
+    _timed_call(pipeline_timings, "init_once", init_once)
+    _timed_call(pipeline_timings, "reset_token_stats", reset_token_stats)
 
     q = (question or "").strip()
     if not q:
         raise ValueError("question is empty")
+    analysis = _timed_call(pipeline_timings, "analyze_question", analyze_question, q, config=config)
 
     # ---- 1) 分类 & 抽计划 ----
     _progress("正在判断问题类型…")
-    cls = classify_question(q, config=config)
+    cls = analysis
     mode = cls["type"]
     need_version = cls["version_sensitive"]
 
     _progress("正在生成检索计划…")
-    qp = extract_query_plan(q, mode=mode, config=config)
+    qp = {
+        "anchors": analysis.get("anchors", []),
+        "rewrite_query": analysis.get("rewrite_query", q),
+        "subquestions": analysis.get("subquestions", []),
+        "detail_level": analysis.get("detail_level", "normal"),
+        "need_version": bool(analysis.get("need_version", need_version)),
+    }
     detail_level = qp.get("detail_level", "normal")
     subquestions = qp.get("subquestions", [])
     need_version = bool(qp.get("need_version", need_version)) or need_version
 
-    retrieval_query = build_retrieval_query(qp)
+    retrieval_query = _timed_call(pipeline_timings, "build_retrieval_query", build_retrieval_query, qp)
 
     # ---- 2) 组 plan（完全复刻 main 的逻辑） ----
     plan = dict(STRATEGIES.get(mode, STRATEGIES["fact"]))
@@ -2860,10 +3212,15 @@ def pipeline(
 
     # ---- 3) 检索 ----
     _progress("正在从 Wiki 检索证据…")
-    evidences = retrieve_with_plan(
+    evidences = _timed_call(
+        pipeline_timings,
+        "retrieve_with_plan_initial",
+        retrieve_with_plan,
         retrieval_query,
         plan,
         anchors=qp.get("anchors"),
+        timing_out=pipeline_timings,
+        timing_prefix="retrieve_initial.",
     )
 
     # ---- 4)（可选）消歧：完全复刻 main ----
@@ -2873,17 +3230,30 @@ def pipeline(
         "forced_ids": [],
     }
 
-    if need_disambiguate(qp.get("anchors", []), evidences):
+    if _timed_call(pipeline_timings, "need_disambiguate", need_disambiguate, qp.get("anchors", []), evidences):
         _progress("检测到消歧迹象，正在进行义项选择…")
         anchors = qp.get("anchors", [])
+        _t_candidates = time.perf_counter()
         candidates_map = {
             a: build_disambig_candidates_for_anchor(a, NORM_TITLES, max_cand=10)
             for a in anchors
         }
-        selections = disambiguate_anchors_with_deepseek(q, anchors, candidates_map, config=config)
+        pipeline_timings["build_disambig_candidates_for_anchor_total"] = int((time.perf_counter() - _t_candidates) * 1000)
+        selections = _timed_call(
+            pipeline_timings,
+            "disambiguate_anchors_with_deepseek",
+            disambiguate_anchors_with_deepseek,
+            q,
+            anchors,
+            candidates_map,
+            config=config,
+        )
         chosen_titles = [t for t in selections.values() if t]
 
-        forced_ids = force_title_chunks(
+        forced_ids = _timed_call(
+            pipeline_timings,
+            "force_title_chunks",
+            force_title_chunks,
             titles=chosen_titles,
             title2idx=TITLE2IDX,
             k_chunks_per_title=4,
@@ -2896,20 +3266,28 @@ def pipeline(
 
         if forced_ids:
             _progress("已获得消歧结果，正在强制覆盖锚点页并重检索…")
-            evidences = retrieve_with_plan(
+            evidences = _timed_call(
+                pipeline_timings,
+                "retrieve_with_plan_disambig",
+                retrieve_with_plan,
                 retrieval_query,
                 plan,
                 anchors=qp.get("anchors"),
                 forced_ids=forced_ids,
+                timing_out=pipeline_timings,
+                timing_prefix="retrieve_disambig.",
             )
 
     # ---- 4.5) section aggregation ----
-    evidences_for_llm = postprocess_evidences(
+    evidences_for_llm = _timed_call(
+    pipeline_timings,
+    "postprocess_evidences",
+    postprocess_evidences,
     evidences,
     max_evidences=used_max_evidences,
     max_chars_per_evidence=int(max_chars_per_evidence),  # 普通段落仍可 600
     debug_out=trace_obj,
-)
+    )
 
     # ---- 5) 去噪/裁剪：完全复刻 main 的 trace_obj 逻辑 ----
     _progress("正在整理证据并组织提示词…")
@@ -2917,21 +3295,29 @@ def pipeline(
     trace_out_path = plan.get("trace_out")
     if plan.get("trace_retrieval") and trace_out_path and os.path.exists(trace_out_path):
         try:
+            _t_load_trace = time.perf_counter()
             with open(trace_out_path, "r", encoding="utf-8") as f:
                 trace_obj = json.load(f)
+            pipeline_timings["load_trace_json"] = int((time.perf_counter() - _t_load_trace) * 1000)
         except Exception:
             trace_obj = None
 
     # used_max_evidences = int(max_evidences) if max_evidences is not None else int(EVIDENCE_FOR_LLM)
 
-    evidences_for_llm = enhance_sections_inplace(
+    evidences_for_llm = _timed_call(
+        pipeline_timings,
+        "enhance_sections_inplace",
+        enhance_sections_inplace,
     evidences_for_llm,
     META_PATH,
-    only_if_section_contains="交易",
+    only_if_section_contains="",
     max_chars=TRADE_EVIDENCE_TEXT_MAX,  # 交易表更长，直接拉高
-)
+    )
 
-    evidences_for_llm = expand_evidence_context_fast(
+    evidences_for_llm = _timed_call(
+        pipeline_timings,
+        "expand_evidence_context_fast",
+        expand_evidence_context_fast,
         evidences_for_llm,
         META_PATH,
         window=2,
@@ -2942,12 +3328,17 @@ def pipeline(
     if plan.get("trace_retrieval") and trace_obj is not None and trace_out_path:
         tmp_path = trace_out_path + ".tmp"
         Path(trace_out_path).parent.mkdir(parents=True, exist_ok=True)
+        _t_write_trace = time.perf_counter()
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(trace_obj, ensure_ascii=False, indent=2))
         os.replace(tmp_path, trace_out_path)
+        pipeline_timings["write_trace_json"] = int((time.perf_counter() - _t_write_trace) * 1000)
 
     # ---- 6) LLM ----
-    messages = build_messages(
+    messages = _timed_call(
+        pipeline_timings,
+        "build_messages",
+        build_messages,
         question=q,
         evidences=evidences_for_llm,
         mode=mode,
@@ -2957,7 +3348,17 @@ def pipeline(
     )
 
     _progress("正在调用 DeepSeek 生成回答…")
-    answer = call_llm(messages, config=config)
+    answer = _timed_call(
+        pipeline_timings,
+        "call_llm",
+        call_llm,
+        messages,
+        config=config,
+        stream_cb=answer_stream_cb,
+    )
+    pipeline_timings["pipeline_total"] = int((time.perf_counter() - pipeline_total_t0) * 1000)
+    if debug_mode:
+        _log_pipeline_timings(q, pipeline_timings)
     if (config.get("debug_mode")):
         print ("[DEBUG]Details informations of this answer:\n")
         print ("[DEBUG]mode:",mode,'\n')
@@ -2979,6 +3380,7 @@ def pipeline(
             "retrieval_query": retrieval_query,
             "plan": plan,
             "disambiguation": disambig,
+            "pipeline_timings_ms": dict(pipeline_timings),
         },
         "evidences_raw": evidences,                 # 全量（可能 30/80/whatever）
         "evidences_for_llm": evidences_for_llm,     # 去噪后喂 LLM 的那批

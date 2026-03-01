@@ -20,6 +20,7 @@
         <header class="topbar">
           <div class="title">Minecraft Wiki 助手</div>
           <div class="status" id="statusLabel">Ready</div>
+          <button id="aboutToggleBtn" class="btn ghost">关于</button>
           <button id="settingsBtn" class="btn">设置</button>
         </header>
         <div id="restartNotice" class="restart-notice hidden">
@@ -31,6 +32,49 @@
           <span id="apiKeyNoticeLink" class="api-key-link">点击这里前往设置</span>
         </div>
         <section class="chat" id="chatList"></section>
+        <section id="aboutPage" class="about-page panel-hidden" aria-labelledby="aboutPageTitle">
+          <article class="about-card">
+            <p class="about-eyebrow">About</p>
+            <h1 id="aboutPageTitle">关于本项目</h1>
+            <p>
+              本项目是一个基于 Minecraft Wiki 内容构建的开源 RAG 工具。
+            </p>
+          </article>
+
+          <article class="about-card">
+            <h2>开源协议</h2>
+            <p>
+              本项目源代码采用 GNU General Public License v3.0 (GPL-3.0) 授权。
+            </p>
+          </article>
+
+          <article class="about-card">
+            <h2>内容来源声明</h2>
+            <p>
+              本软件部分数据来源于 Minecraft Wiki，原始内容由 Minecraft Wiki contributors 提供，依据
+              Creative Commons Attribution-NonCommercial-ShareAlike 3.0 License 授权。
+            </p>
+            <p>
+              本项目对公开内容进行了索引与再处理。所有原始内容仍遵循其原始许可协议。
+            </p>
+            <p>本软件仅用于非商业用途。</p>
+          </article>
+
+          <article class="about-card">
+            <h2>商标声明</h2>
+            <p>
+              Minecraft 是 Mojang Studios 的商标。本项目与 Mojang Studios 或 Microsoft 无任何官方关联。
+            </p>
+          </article>
+
+          <article class="about-card about-donate-card">
+            <h2>支持开发者</h2>
+            <p>如果您觉得本项目对您有帮助，可以选择支持开发者。</p>
+            <p>所有捐赠均为自愿行为，仅用于支持软件的持续开发与维护。</p>
+            <p>捐赠不构成对任何内容的付费，也不会解锁额外功能。</p>
+            <button id="donatePreviewBtn" class="btn about-donate-btn">查看捐赠码</button>
+          </article>
+        </section>
 
         <footer class="input-bar">
           <textarea id="inputArea" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
@@ -45,6 +89,11 @@
         <div class="form">
           <label>API Key</label>
           <input type="password" id="cfgApiKey" />
+          <div class="form-help api-key-help">
+            <button type="button" id="deepseekApiKeyLink" class="settings-inline-link">
+              没有API key？点击这里申请
+            </button>
+          </div>
 
           <label>API Base</label>
           <input type="text" id="cfgApiBase" />
@@ -78,6 +127,16 @@
         <div class="modal-actions">
           <button id="settingsCancel" class="btn ghost">取消</button>
           <button id="settingsSave" class="btn">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="donateModal" class="modal hidden donate-modal">
+      <div class="modal-content donate-modal-content">
+        <div class="modal-title">支持开发者</div>
+        <img id="donateImage" class="donate-image" src="/donate.jpg" alt="捐赠二维码" />
+        <div class="modal-actions">
+          <button id="donateCloseBtn" class="btn">关闭</button>
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@ def run_pipeline(
     question: str,
     config: Dict[str, Any],
     progress_cb: Optional[Callable[[str], None]] = None,
+    answer_stream_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     t0 = time.time()
 
@@ -15,6 +16,7 @@ def run_pipeline(
 
     kwargs: Dict[str, Any] = {
         "progress_cb": progress_cb,
+        "answer_stream_cb": answer_stream_cb,
         "config": config,  # ✅ 新增：把 config 直接传进去
     }
 

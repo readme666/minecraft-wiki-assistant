@@ -190,20 +190,34 @@ def _start_task(session_id: str, message_id: str, text: str, config: Dict[str, A
         _tasks[key] = state
 
     def runner():
-        last_emit = 0.0
+        last_progress_emit = 0.0
         pending_text: Optional[str] = None
+        last_answer_emit = 0.0
+        pending_answer: str = ""
 
         def _emit_progress(txt: str, force: bool = False):
-            nonlocal last_emit, pending_text
+            nonlocal last_progress_emit, pending_text
             now = time.time()
             pending_text = txt
-            if force or (now - last_emit) >= 0.05:
-                last_emit = now
+            if force or (now - last_progress_emit) >= 0.05:
+                last_progress_emit = now
                 state.queue.put({"event": "progress", "data": {"text": pending_text}})
                 pending_text = None
 
         def progress_cb(msg: str):
             _emit_progress(msg, force=False)
+
+        def _emit_answer_delta(txt: str, force: bool = False):
+            nonlocal last_answer_emit, pending_answer
+            now = time.time()
+            pending_answer += txt
+            if force or (now - last_answer_emit) >= 0.05:
+                last_answer_emit = now
+                state.queue.put({"event": "answer_delta", "data": {"delta": pending_answer}})
+                pending_answer = ""
+
+        def answer_stream_cb(chunk: str):
+            _emit_answer_delta(chunk, force=False)
 
         try:
             from backend import rag_cli
@@ -211,9 +225,16 @@ def _start_task(session_id: str, message_id: str, text: str, config: Dict[str, A
             print("[DEBUG] rag_cli.__file__ =", getattr(rag_cli, "__file__", None))
             print("[DEBUG] has pipeline =", hasattr(rag_cli, "pipeline"))
             print("[DEBUG] sys.path[0:5] =", sys.path[:5])
-            result = run_pipeline(text, config, progress_cb=progress_cb)
+            result = run_pipeline(
+                text,
+                config,
+                progress_cb=progress_cb,
+                answer_stream_cb=answer_stream_cb,
+            )
             if pending_text:
                 state.queue.put({"event": "progress", "data": {"text": pending_text}})
+            if pending_answer:
+                state.queue.put({"event": "answer_delta", "data": {"delta": pending_answer}})
             final_data = {
                 "answer": result.get("answer", ""),
                 "evidences_for_llm": result.get("evidences_for_llm") or [],

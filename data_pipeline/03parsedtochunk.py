@@ -18,6 +18,8 @@ _SIMPLE_TEMPLATE_MAP = {
 }
 
 WIKITABLE_RE = re.compile(r"\{\|[\s\S]*?\|\}", re.M)
+STRUCTURED_SEGMENT_RE = re.compile(r"[^|:\n]+[:：][^|]+")
+STRUCTURED_LINE_SPLIT_RE = re.compile(r"\s*\|\s*")
 
 # --------- 交易行规范化 ----------
 TRADE_PREFIX_RE = re.compile(r"^\s*交\s*易\s*[:：]\s*", re.I)
@@ -26,6 +28,26 @@ TRADE_PREFIX_RE2 = re.compile(r"^\s*交易\s*[:：]\s*", re.I)
 def is_trade_head_line(s: str) -> bool:
     s = s.strip()
     return bool(TRADE_PREFIX_RE.match(s) or TRADE_PREFIX_RE2.match(s))
+
+
+def is_structured_line(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    if is_trade_head_line(s):
+        return True
+    if "|" not in s:
+        return False
+
+    parts = [p.strip() for p in STRUCTURED_LINE_SPLIT_RE.split(s) if p.strip()]
+    if len(parts) < 2:
+        return False
+
+    score = 0
+    for part in parts:
+        if STRUCTURED_SEGMENT_RE.fullmatch(part):
+            score += 1
+    return score >= 2
 
 def normalize_trade_line(line: str, default_currency: str = "Emerald") -> str:
     raw = line.strip()
@@ -283,8 +305,31 @@ def chunk_trade_block(trade_lines: List[str], per_chunk: int = 10, overlap_trade
     return chunks
 
 
+def chunk_structured_block(lines: List[str], per_chunk: int = 12, overlap_lines: int = 1) -> List[str]:
+    if not lines:
+        return []
+
+    chunks: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        j = min(i + per_chunk, n)
+        blk = "\n".join(lines[i:j]).strip()
+        if blk:
+            chunks.append(blk)
+
+        if j >= n:
+            break
+        i = max(0, j - overlap_lines)
+        if i == j:
+            i = j
+
+    return chunks
+
+
 def chunk_mixed_text(text: str, chunk_size: int = 900, overlap: int = 150,
-                     trade_per_chunk: int = 10, trade_overlap: int = 1) -> List[str]:
+                     trade_per_chunk: int = 10, trade_overlap: int = 1,
+                     structured_per_chunk: int = 12, structured_overlap: int = 1) -> List[str]:
     """
     对 text 段进行更聪明的切分：
     - 连续的“交易:”行：按条目数切块
@@ -295,6 +340,7 @@ def chunk_mixed_text(text: str, chunk_size: int = 900, overlap: int = 150,
 
     normal_buf: List[str] = []
     trade_buf: List[str] = []
+    structured_buf: List[str] = []
 
     def flush_normal():
         nonlocal normal_buf
@@ -308,21 +354,41 @@ def chunk_mixed_text(text: str, chunk_size: int = 900, overlap: int = 150,
             out_chunks.extend(chunk_trade_block(trade_buf, per_chunk=trade_per_chunk, overlap_trades=trade_overlap))
             trade_buf = []
 
+    def flush_structured():
+        nonlocal structured_buf
+        if structured_buf:
+            out_chunks.extend(
+                chunk_structured_block(
+                    structured_buf,
+                    per_chunk=structured_per_chunk,
+                    overlap_lines=structured_overlap,
+                )
+            )
+            structured_buf = []
+
     for ln in lines:
         s = ln.strip()
         if not s:
             flush_trade()
+            flush_structured()
             flush_normal()
             continue
 
         if s.startswith("交易:"):
+            flush_structured()
             flush_normal()
             trade_buf.append(s)
+        elif is_structured_line(s):
+            flush_trade()
+            flush_normal()
+            structured_buf.append(s)
         else:
             flush_trade()
+            flush_structured()
             normal_buf.append(ln)
 
     flush_trade()
+    flush_structured()
     flush_normal()
     return out_chunks
 
@@ -335,9 +401,9 @@ def chunk_text_with_tables(text: str, chunk_size: int = 900, overlap: int = 150)
     chunks: List[str] = []
     for kind, seg in tokens:
         if kind == "text":
-            # ✅ 用新的 mixed chunk
             chunks.extend(chunk_mixed_text(seg, chunk_size=chunk_size, overlap=overlap,
-                                           trade_per_chunk=10, trade_overlap=1))
+                                           trade_per_chunk=10, trade_overlap=1,
+                                           structured_per_chunk=12, structured_overlap=1))
         else:
             md = parse_wikitable_to_markdown(seg) or seg.strip()
             table_chunk = "[WIKITABLE]\n" + md + "\n[/WIKITABLE]"
@@ -369,8 +435,11 @@ def normalize_section_text(sec_text: str) -> str:
         lines2.append(normalize_trade_line(ln, default_currency="Emerald"))
     sec_text = "\n".join(lines2)
 
-    # 3) 非表格清洗，表格原样保留
+    # Parsed data is already mostly plain text; keep legacy table support as fallback.
     toks = split_text_keep_wikitable(sec_text)
+    if not toks:
+        return strip_wiki_markup(sec_text)
+
     out_parts: List[str] = []
     for kind, seg in toks:
         if kind == "text":
