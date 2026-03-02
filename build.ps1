@@ -42,7 +42,7 @@ function Invoke-Python {
 function Get-PythonVersion {
     param([string]$PythonCommand)
 
-    $script = 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}")'
+    $script = 'import sys; print("%d.%d.%d" % sys.version_info[:3])'
     $output = Invoke-Python -PythonCommand $PythonCommand -Arguments @("-c", $script) 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $output) {
         throw "Failed to detect Python version."
