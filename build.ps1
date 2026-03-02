@@ -95,9 +95,19 @@ if (-not $pythonCommand) {
 
 Assert-MinimumPythonVersion -PythonCommand $pythonCommand
 
-foreach ($tool in @("npm")) {
+foreach ($tool in @("npm", "cargo", "rustc")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        Write-Error "$tool was not found in PATH. Install Node.js/npm first, then rerun this script."
+        switch ($tool) {
+            "npm" {
+                Write-Error "$tool was not found in PATH. Install Node.js/npm first, then rerun this script."
+            }
+            "cargo" {
+                Write-Error "$tool was not found in PATH. Install Rust (cargo) first, then rerun this script."
+            }
+            "rustc" {
+                Write-Error "$tool was not found in PATH. Install Rust (rustc) first, then rerun this script."
+            }
+        }
     }
 }
 
