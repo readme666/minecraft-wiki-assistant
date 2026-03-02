@@ -1,4 +1,5 @@
 # MineRAG
+![LOGO](tauri-app/src/public/backround.png)
 
 MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 
@@ -17,9 +18,16 @@ MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 - 支持证据引用、调试信息、token 与成本估算
 - 提供桌面端界面和命令行两种使用方式
 
+## 全过程流程图
+
+![Whole_Process](Whole_Process.png)
+
+## RAG流程图
+
+![RAG](RAG.png)
+
 ## 仓库结构
 
-以下结构基于当前仓库实际提交内容整理：
 
 ```text
 .
@@ -52,38 +60,6 @@ MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 - `build.ps1`：给自行编译用户的一键构建脚本。
 
 ## 运行方式
-
-### 1. 运行已构建产物
-
-如果你已经拿到了构建好的 `MineRAG.exe`，可直接运行：
-
-```powershell
-.\MineRAG.exe
-```
-
-桌面端启动后会自动拉起 Python 后端。
-
-注意：
-
-- 如果可执行文件目录下存在内置 `python/`，程序会优先使用它。
-- 如果没有内置 Python，则会回退到系统环境中的 `pythonw` 或 `python`。
-- 因此，对于“自行编译并运行”的用户，默认要求本机已安装 Python。
-
-### 2. 命令行问答
-
-直接提问：
-
-```powershell
-python backend/rag_cli.py --question "村民会卖什么？" --api-key "<YOUR_DEEPSEEK_KEY>"
-```
-
-交互模式：
-
-```powershell
-python backend/rag_cli.py --interactive --api-key "<YOUR_DEEPSEEK_KEY>"
-```
-
-## 开发环境运行
 
 ### 环境要求
 
@@ -168,7 +144,6 @@ index/meta_all.jsonl
 
 - `01get_titles_parsed.py` 需要联网访问 Minecraft 中文 Wiki API。
 - `03buildindex.py` 首次运行可能会下载 Hugging Face 模型，耗时较长。
-- `index/`、`chunks/`、`data/` 这类目录通常是构建产物目录，不一定会直接提交到仓库。
 
 ## 桌面端构建结果
 
