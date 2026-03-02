@@ -5,6 +5,7 @@ import json
 import time
 import threading
 import queue
+import socket
 import traceback
 from typing import Any, Dict, Optional
 
@@ -424,25 +425,36 @@ def _on_startup():
 if __name__ == "__main__":
     import uvicorn
     import traceback
+    from uvicorn import Config, Server
     from logging_utils import setup_file_logging
 
     cfg = load_config()
     debug_mode = bool(cfg.get("debug_mode", False))
 
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", PORT))
+    server_socket.listen(2048)
+    actual_port = int(server_socket.getsockname()[1])
+
+    # Rust 侧通过 stdout 捕获实际监听端口。
+    print(f"PORT={actual_port}", flush=True)
+
     log_path = setup_file_logging(debug=debug_mode)
 
     import logging
-    logging.getLogger("server").info("about to start uvicorn...")
+    logging.getLogger("server").info("about to start uvicorn on 127.0.0.1:%s...", actual_port)
 
     try:
-        uvicorn.run(
+        config = Config(
             app,
             host="127.0.0.1",
-            port=PORT,
+            port=actual_port,
             log_level=("debug" if debug_mode else "info"),
             access_log=True,
             log_config=None,
         )
+        Server(config).run(sockets=[server_socket])
     except Exception:
         # 1) 写到 server.log（如果 logging 可用）
         logging.getLogger("server").exception("uvicorn.run crashed")
@@ -451,3 +463,8 @@ if __name__ == "__main__":
         fatal = log_path.parent / "fatal.log"
         fatal.write_text(traceback.format_exc(), encoding="utf-8")
         raise
+    finally:
+        try:
+            server_socket.close()
+        except Exception:
+            pass

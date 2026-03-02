@@ -1,11 +1,13 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, RunEvent, State, WindowEvent};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -15,6 +17,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 struct BackendGuard {
     child: Option<Child>,
+    port: Option<u16>,
 }
 
 impl Drop for BackendGuard {
@@ -28,8 +31,14 @@ impl Drop for BackendGuard {
 struct BackendState(Mutex<BackendGuard>);
 
 #[tauri::command]
-fn restart_app(app: tauri::AppHandle) {
+fn restart_app(app: tauri::AppHandle, state: State<BackendState>) {
+    kill_python_backend(&state);
     app.restart();
+}
+
+#[tauri::command]
+fn get_backend_port(state: State<BackendState>) -> Option<u16> {
+    state.0.lock().unwrap().port
 }
 
 fn read_debug_mode(data_dir: &PathBuf) -> bool {
@@ -74,20 +83,93 @@ fn backend_python_candidates(exe_dir: &PathBuf, debug_mode: bool) -> Vec<PathBuf
     candidates
 }
 
-fn start_backend(data_dir: Option<PathBuf>, debug_mode: bool) -> Option<Child> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    
-    let server = exe_dir.join("pyserver").join("server.py");
-    if !server.exists() {
-        eprintln!("[backend] server.py not found: {:?}", server);
-        return None;
+fn backend_server_candidates(exe_dir: &PathBuf) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // 开发态：固定回到仓库根目录使用源码版 pyserver/server.py。
+    let dev_server = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("pyserver")
+        .join("server.py");
+    candidates.push(dev_server);
+
+    // 打包态：使用可执行文件旁边携带的 pyserver/server.py。
+    candidates.push(exe_dir.join("pyserver").join("server.py"));
+
+    candidates
+}
+
+fn resolve_backend_server(exe_dir: &PathBuf) -> Option<PathBuf> {
+    for candidate in backend_server_candidates(exe_dir) {
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
+    None
+}
+
+fn parse_backend_port_line(line: &str) -> Option<u16> {
+    line.trim()
+        .strip_prefix("PORT=")
+        .and_then(|v| v.parse::<u16>().ok())
+}
+
+fn wait_backend_port(child: &mut Child) -> Option<u16> {
+    let stdout = child.stdout.take()?;
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut port_sent = false;
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if !port_sent {
+                        if let Some(port) = parse_backend_port_line(&line) {
+                            let _ = port_tx.send(port);
+                            port_sent = true;
+                            continue;
+                        }
+                    }
+                    if !line.trim().is_empty() {
+                        eprintln!("[backend stdout] {}", line);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[backend] failed reading stdout: {}", err);
+                    break;
+                }
+            }
+        }
+    });
+
+    port_rx.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+fn start_backend(data_dir: Option<PathBuf>, debug_mode: bool) -> Option<(Child, u16)> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+
+    let Some(server) = resolve_backend_server(&exe_dir) else {
+        eprintln!(
+            "[backend] server.py not found. checked: {:?}",
+            backend_server_candidates(&exe_dir)
+        );
+        return None;
+    };
+    let server_root = server
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| exe_dir.clone());
 
     for python_bin in backend_python_candidates(&exe_dir, debug_mode) {
         let mut cmd = Command::new(&python_bin);
         cmd.arg(&server)
-            .current_dir(&exe_dir)
-            .env("BACKEND_PORT", "8000");
+            .current_dir(&server_root)
+            .env("BACKEND_PORT", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
 
         // 把 tauri 的 app_data_dir 传给 python（统一 config/logs 目录）
         if let Some(d) = data_dir.as_ref() {
@@ -101,40 +183,63 @@ fn start_backend(data_dir: Option<PathBuf>, debug_mode: bool) -> Option<Child> {
         }
 
         match cmd.spawn() {
-            Ok(child) => {
-                eprintln!("[backend] started with {:?}", python_bin);
-                return Some(child);
+            Ok(mut child) => {
+                let Some(port) = wait_backend_port(&mut child) else {
+                    eprintln!(
+                        "[backend] started process but did not receive PORT line: python={:?}, server={:?}",
+                        python_bin, server
+                    );
+                    stop_backend(&mut child);
+                    continue;
+                };
+                eprintln!(
+                    "[backend] started python backend: python={:?}, server={:?}, cwd={:?}, port={}",
+                    python_bin, server, server_root, port
+                );
+                return Some((child, port));
             }
             Err(err) => {
-                eprintln!("[backend] failed to start with {:?}: {}", python_bin, err);
+                eprintln!(
+                    "[backend] failed to start python backend: python={:?}, server={:?}, err={}",
+                    python_bin, server, err
+                );
             }
         }
     }
 
-    eprintln!("[backend] no usable python runtime found");
+    eprintln!("[backend] no usable python runtime found for {:?}", server);
     None
 }
 
 fn stop_backend(child: &mut Child) {
     let pid = child.id().to_string();
-    std::thread::spawn(move || {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid])
-                .status();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = Command::new("kill").arg(&pid).status();
-        }
-    });
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid])
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").arg(&pid).status();
+    }
+}
+
+fn kill_python_backend(state: &BackendState) {
+    let mut guard = state.0.lock().unwrap();
+    guard.port = None;
+    if let Some(mut child) = guard.child.take() {
+        stop_backend(&mut child);
+    }
 }
 
 fn main() {
     tauri::Builder::default()
-        .manage(BackendState(Mutex::new(BackendGuard { child: None })))
-        .invoke_handler(tauri::generate_handler![restart_app])
+        .manage(BackendState(Mutex::new(BackendGuard {
+            child: None,
+            port: None,
+        })))
+        .invoke_handler(tauri::generate_handler![restart_app, get_backend_port])
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
 
@@ -144,27 +249,34 @@ fn main() {
                 .map(read_debug_mode)
                 .unwrap_or(false);
 
-            let child = start_backend(data_dir, debug_mode);
+            let backend = start_backend(data_dir, debug_mode);
 
-            if child.is_none() {
+            if backend.is_none() {
                 eprintln!("[backend] failed to start backend");
             }
 
             let state = app.state::<BackendState>();
-            state.0.lock().unwrap().child = child;
+            let mut guard = state.0.lock().unwrap();
+            if let Some((child, port)) = backend {
+                guard.child = Some(child);
+                guard.port = Some(port);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
                 let state = window.state::<BackendState>();
-                let mut guard = state.0.lock().unwrap();
-                if let Some(mut child) = guard.child.take() {
-                    stop_backend(&mut child);
-                }
+                kill_python_backend(&state);
             }
         })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init()) // ✅ 只 init 一次
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+                let state = app_handle.state::<BackendState>();
+                kill_python_backend(&state);
+            }
+        });
 }

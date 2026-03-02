@@ -6,7 +6,6 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { appDataDir } from "@tauri-apps/api/path";
 const cfgDebugMode = document.getElementById("cfgDebugMode");
 const openLogDirBtn = document.getElementById("openLogDirBtn");
-const API_BASE = "http://127.0.0.1:8000";
 
 const chatList = document.getElementById("chatList");
 const sessionList = document.getElementById("sessionList");
@@ -76,8 +75,33 @@ let viewTransitionTimer = null;
 let isViewTransitioning = false;
 let emptyStateWikiLinks = [];
 let wikiTitlePool = [];
+let apiBase = null;
 const SETTINGS_MODAL_ANIMATION_MS = 420;
 const SETTINGS_MODAL_CONTENT_FADE_MS = 260;
+
+async function getApiBase(retries = 20, delayMs = 250) {
+  if (apiBase) {
+    return apiBase;
+  }
+
+  let lastPort = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const port = await invoke("get_backend_port");
+      lastPort = Number(port);
+      if (Number.isInteger(lastPort) && lastPort > 0) {
+        apiBase = `http://127.0.0.1:${lastPort}`;
+        return apiBase;
+      }
+    } catch (_) {}
+
+    if (i < retries) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw new Error(`Backend port unavailable: ${lastPort ?? "unknown"}`);
+}
 
 function prefersReducedMotion() {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1735,7 +1759,8 @@ async function sendMessage() {
   let res;
   try {
     const api_key = getApiKey();
-    res = await fetchJsonWithRetry(`${API_BASE}/api/send`, {
+    const base = await getApiBase();
+    res = await fetchJsonWithRetry(`${base}/api/send`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, text, api_key })
@@ -1755,17 +1780,20 @@ async function sendMessage() {
   }
   const { message_id } = res;
   const requestSessionId = sessionId;
-  const streamUrl = `${API_BASE}/api/stream?session_id=${encodeURIComponent(sessionId)}&message_id=${encodeURIComponent(message_id)}`;
+  const base = await getApiBase();
+  const streamUrl = `${base}/api/stream?session_id=${encodeURIComponent(sessionId)}&message_id=${encodeURIComponent(message_id)}`;
 
   let finished = false;
   let retried = false;
   let es = null;
   let streamedAnswerText = "";
   let streamRenderScheduled = false;
+  let streamRenderFrame = null;
 
   const flushStreamingMarkdown = () => {
+    streamRenderFrame = null;
     streamRenderScheduled = false;
-    if (sessionId !== requestSessionId) {
+    if (finished || sessionId !== requestSessionId) {
       return;
     }
     renderAssistantMarkdownBubble(assistantMsg.bubble, { text: streamedAnswerText || "(无回答)" });
@@ -1777,7 +1805,7 @@ async function sendMessage() {
       return;
     }
     streamRenderScheduled = true;
-    window.requestAnimationFrame(flushStreamingMarkdown);
+    streamRenderFrame = window.requestAnimationFrame(flushStreamingMarkdown);
   };
 
   const ensureStreamingBubble = () => {
@@ -1843,6 +1871,12 @@ async function sendMessage() {
     es.addEventListener("final", (ev) => {
       try {
         const data = JSON.parse(ev.data);
+        finished = true;
+        if (streamRenderFrame !== null) {
+          window.cancelAnimationFrame(streamRenderFrame);
+          streamRenderFrame = null;
+        }
+        streamRenderScheduled = false;
         assistantMessage.status = "normal";
         assistantMessage.text = data.answer || streamedAnswerText || "(无回答)";
         assistantMessage.evidences_for_llm = data.evidences_for_llm || [];
@@ -1862,7 +1896,6 @@ async function sendMessage() {
           }
         }
 
-        finished = true;
         if (es) {
           es.close();
         }
@@ -1875,6 +1908,12 @@ async function sendMessage() {
     es.addEventListener("backend_error", (ev) => {
       try {
         const data = JSON.parse(ev.data || "{}");
+        finished = true;
+        if (streamRenderFrame !== null) {
+          window.cancelAnimationFrame(streamRenderFrame);
+          streamRenderFrame = null;
+        }
+        streamRenderScheduled = false;
         assistantMessage.status = "error";
         assistantMessage.text = `发生错误：${data.error || "未知错误"}`;
         activeSession.updatedAt = Date.now();
@@ -1887,7 +1926,6 @@ async function sendMessage() {
           applyShakeOnce(assistantMsg.bubble);
         }
 
-        finished = true;
         if (es) es.close();
         setStatus("Error");
         sendBtn.disabled = false;
@@ -1906,6 +1944,12 @@ async function sendMessage() {
         setTimeout(startStream, 500);
         return;
       }
+      finished = true;
+      if (streamRenderFrame !== null) {
+        window.cancelAnimationFrame(streamRenderFrame);
+        streamRenderFrame = null;
+      }
+      streamRenderScheduled = false;
       removeThinking(assistantMsg.bubble);
       assistantMsg.bubble.textContent = "发生错误：后端流中断";
       assistantMsg.bubble.classList.add("error");
@@ -1986,7 +2030,8 @@ function updateInputBarLayout(lineHeight = null) {
 
 async function openSettings(sourceEl = settingsBtn) {
   try {
-    const cfg = await fetchJsonWithRetry(`${API_BASE}/api/config`, {}, 8, 500);
+    const base = await getApiBase();
+    const cfg = await fetchJsonWithRetry(`${base}/api/config`, {}, 8, 500);
 
     // ✅ api_key：优先本地缓存，其次用后端返回（如果后端未来支持 env key）
     const savedKey = localStorage.getItem(LS_API_KEY) || "";
@@ -2068,8 +2113,9 @@ settingsSave.addEventListener("click", async () => {
   const settingsChanged = hasSettingsChanged(nextSnapshot);
 
   try {
+    const base = await getApiBase();
     await fetchJsonWithRetry(
-      `${API_BASE}/api/config`,
+      `${base}/api/config`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2114,9 +2160,17 @@ window.addEventListener("resize", () => updateInputBarLayout());
 
 document.documentElement.style.setProperty("--font-size", "14px");
 async function waitBackendReady() {
+  let base;
+  try {
+    base = await getApiBase();
+  } catch (_) {
+    setStatus("Backend port unavailable");
+    return;
+  }
+
   for (let i = 0; i < 20; i++) {
     try {
-      const res = await fetch(`${API_BASE}/api/health`);
+      const res = await fetch(`${base}/api/health`);
       if (res.ok) {
         setStatus("Ready");
         return;

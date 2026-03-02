@@ -1,79 +1,98 @@
-# Minecraft Wiki Assistant
+# MineRAG
 
-一个面向 Minecraft 中文 Wiki 的桌面 RAG 问答工具。  
-项目使用本地向量检索定位 Wiki 证据，再调用 DeepSeek 生成最终回答。检索、索引和 Embedding 都在本地完成，联网部分只用于调用大模型接口。
+MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
+
+它的检索、向量索引和 Embedding 都在本地完成，问答生成通过 DeepSeek API 完成。项目同时提供：
+
+- Tauri 桌面前端
+- FastAPI Python 后端
+- 命令行问答入口
+- 数据清洗、切块、建索引脚本
 
 ## 功能概览
 
 - 基于 `FAISS` 的本地向量检索
-- 本地 `Sentence-Transformers` Embedding 模型
-- `DeepSeek` 生成最终回答
-- 桌面端基于 `Tauri`
-- 后端服务基于 `FastAPI`
-- 支持证据引用、会话历史、成本估算、日志查看
-- 支持命令行调用 `backend/rag_cli.py`
+- 使用 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` 生成向量
+- 使用 DeepSeek 进行最终回答生成
+- 支持证据引用、调试信息、token 与成本估算
+- 提供桌面端界面和命令行两种使用方式
 
-## 当前架构
+## 仓库结构
 
-```text
-用户问题
-  -> 问题分类 / 查询改写
-  -> 本地 FAISS 检索
-  -> 证据后处理与扩展
-  -> DeepSeek 生成回答
-  -> 返回答案 + 证据 + token / cost 信息
-```
-
-核心本地模型：
+以下结构基于当前仓库实际提交内容整理：
 
 ```text
-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+.
+├─ backend/
+│  ├─ backend.py
+│  └─ rag_cli.py
+├─ data_pipeline/
+│  ├─ 01get_titles_parsed.py
+│  ├─ 02parsedtochunk.py
+│  └─ 03buildindex.py
+├─ pyserver/
+│  ├─ requirements.txt
+│  └─ server.py
+├─ tauri-app/
+│  ├─ package.json
+│  ├─ src/
+│  └─ src-tauri/
+├─ config.py
+├─ logging_utils.py
+├─ build.ps1
+└─ Readme.md
 ```
 
-## 项目结构
+说明：
 
-```text
-source/
-├── backend/
-│   ├── backend.py
-│   └── rag_cli.py
-├── pyserver/
-│   ├── server.py
-│   └── requirements.txt
-├── tauri-app/
-│   ├── src/
-│   └── src-tauri/
-├── data_pipeline/
-├── index/
-├── chunks/
-├── data/
-├── titles/
-├── xml/
-├── config.py
-└── minecraft-wiki-assistant.exe
-```
+- `backend/`：核心问答与检索逻辑。
+- `pyserver/`：FastAPI 服务，供 Tauri 前端调用。
+- `data_pipeline/`：Wiki 数据解析、切块、建索引流程。
+- `tauri-app/`：桌面端前端与 Tauri 壳。
+- `build.ps1`：给自行编译用户的一键构建脚本。
 
 ## 运行方式
 
-### 1. 直接运行已打包版本
+### 1. 运行已构建产物
 
-仓库根目录已经包含：
+如果你已经拿到了构建好的 `MineRAG.exe`，可直接运行：
 
 ```powershell
-.\minecraft-wiki-assistant.exe
+.\MineRAG.exe
 ```
 
-桌面程序启动后会拉起后端。
-如果项目目录下存在内置 `python/` 运行时，会优先使用它；如果不存在，则会自动回退到系统默认 Python 环境。
+桌面端启动后会自动拉起 Python 后端。
 
-### 2. 本地开发运行
+注意：
 
-前提：
+- 如果可执行文件目录下存在内置 `python/`，程序会优先使用它。
+- 如果没有内置 Python，则会回退到系统环境中的 `pythonw` 或 `python`。
+- 因此，对于“自行编译并运行”的用户，默认要求本机已安装 Python。
 
+### 2. 命令行问答
+
+直接提问：
+
+```powershell
+python backend/rag_cli.py --question "村民会卖什么？" --api-key "<YOUR_DEEPSEEK_KEY>"
+```
+
+交互模式：
+
+```powershell
+python backend/rag_cli.py --interactive --api-key "<YOUR_DEEPSEEK_KEY>"
+```
+
+## 开发环境运行
+
+### 环境要求
+
+- Windows
 - Python 3.10+
 - Node.js 18+
 - Rust / Cargo
-- 已准备好 `index/faiss_all.index` 和 `index/meta_all.jsonl`
+
+### 安装依赖
 
 安装 Python 依赖：
 
@@ -81,42 +100,96 @@ source/
 pip install -r pyserver/requirements.txt
 ```
 
-如果你是从源码编译并运行项目，而且使用的是本机 Python（而不是项目内置的 `python/` 目录），则必须先按 [pyserver/requirements.txt](/c:/minecraft-ass/source/pyserver/requirements.txt) 安装这些依赖。
-
-启动前端开发环境：
+安装前端依赖：
 
 ```powershell
 cd tauri-app
 npm install
+```
+
+### 启动开发版桌面端
+
+```powershell
+cd tauri-app
 npm run tauri dev
 ```
 
-### 3. 单独运行命令行问答
+开发模式下，Tauri 会从源码目录启动 `pyserver/server.py`。
+
+## 自行编译
+
+仓库根目录提供了自动构建脚本 [build.ps1](/c:/minecraft-ass/source/build.ps1)。
+
+它会自动完成以下步骤：
+
+1. 检查 `Python` 和 `npm` 是否可用
+2. 安装 `pyserver/requirements.txt` 中的 Python 依赖
+3. 运行数据构建脚本
+4. 在 `tauri-app` 下执行 `npm run tauri build`
+5. 将生成的 `MineRAG.exe` 复制到仓库根目录
+
+运行方式：
 
 ```powershell
-python backend/rag_cli.py --question "村民会卖什么" --api-key "<YOUR_DEEPSEEK_KEY>"
+powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-或进入交互模式：
+如果系统中没有 Python，脚本会直接提示并退出。
+
+## 数据构建流程
+
+当前仓库中的数据流程由以下 3 个脚本组成：
+
+```text
+data_pipeline/01get_titles_parsed.py
+data_pipeline/02parsedtochunk.py
+data_pipeline/03buildindex.py
+```
+
+它们的职责分别是：
+
+1. `01get_titles_parsed.py`
+   从 Minecraft 中文 Wiki 拉取页面内容，生成解析后的 `jsonl` 数据。
+2. `02parsedtochunk.py`
+   将解析后的页面切分为适合检索的 chunks。
+3. `03buildindex.py`
+   对 chunks 生成 embedding，并构建 FAISS 索引与元数据文件。
+
+最终会生成的核心产物通常包括：
+
+```text
+data/data_parsed.jsonl
+chunks/chunks_all.jsonl
+index/faiss_all.index
+index/meta_all.jsonl
+```
+
+说明：
+
+- `01get_titles_parsed.py` 需要联网访问 Minecraft 中文 Wiki API。
+- `03buildindex.py` 首次运行可能会下载 Hugging Face 模型，耗时较长。
+- `index/`、`chunks/`、`data/` 这类目录通常是构建产物目录，不一定会直接提交到仓库。
+
+## 桌面端构建结果
+
+Tauri 当前产品名为 `MineRAG`，执行以下命令后：
 
 ```powershell
-python backend/rag_cli.py --interactive --api-key "<YOUR_DEEPSEEK_KEY>"
+cd tauri-app
+npm run tauri build
+```
+
+Windows 可执行文件会生成到：
+
+```text
+tauri-app/src-tauri/target/release/MineRAG.exe
 ```
 
 ## 配置说明
 
-应用实际会使用两类配置：
+运行时配置由 [config.py](/c:/minecraft-ass/source/config.py) 管理。
 
-- 后端配置文件：`config.json`
-- 前端本地缓存：浏览器 `localStorage`
-
-其中：
-
-- `api_key` 默认不会写入后端 `config.json`
-- 桌面端设置页里填写的 API Key 会保存在前端本地存储，用于后续请求时传给后端
-- 其余设置如 `api_base`、`model`、`font_size`、`debug_mode` 会写入配置文件
-
-默认配置项可在 [config.py](/c:/minecraft-ass/source/config.py) 中查看，包括：
+默认配置项包括：
 
 - `api_base`
 - `model`
@@ -126,54 +199,33 @@ python backend/rag_cli.py --interactive --api-key "<YOUR_DEEPSEEK_KEY>"
 - `output_per_million`
 - `font_size`
 - `debug_mode`
+- `log_level`
 
-## 数据目录
+补充说明：
 
-运行时配置和日志目录由环境变量 `MWA_DATA_DIR` 决定。  
-在桌面版中，这个路径由 Tauri 的 `app_data_dir` 注入，通常位于应用数据目录下，包含：
+- `api_key` 默认不落盘保存。
+- 运行时可以通过前端输入 API Key，或通过命令行参数 / 环境变量传入。
+- 环境变量 `DEEPSEEK_API_KEY` 或 `API_KEY` 会覆盖默认空值。
+
+## 数据目录与日志
+
+项目运行时依赖环境变量 `MWA_DATA_DIR` 指定数据目录。
+
+桌面端启动 Python 后端时，会自动把 Tauri 的 `app_data_dir` 注入为 `MWA_DATA_DIR`，用于统一保存：
 
 ```text
 config.json
 logs/
 ```
 
-## 日志
+日志目录由 [logging_utils.py](/c:/minecraft-ass/source/logging_utils.py) 和 [config.py](/c:/minecraft-ass/source/config.py) 统一处理。
 
-后端日志位于：
+常见日志文件：
 
 ```text
 logs/server.log
-```
-
-如果后端启动失败，还可能出现：
-
-```text
 logs/fatal.log
 ```
-
-## 数据构建流程
-
-如果你需要从 Wiki 原始数据重建索引，流程对应 `data_pipeline/` 下的脚本：
-
-```text
-00collect_allpages.py   获取页面标题
-01xmltojson.py          将 XML dump 转为 JSONL
-02dumptoparsed.py       展开模板并解析页面
-03parsedtochunk.py      切分 chunk
-04buildindex.py         生成向量索引与元数据
-```
-
-最终产物是：
-
-```text
-index/faiss_all.index
-index/meta_all.jsonl
-```
-
-说明：
-
-- `00collect_allpages.py`、`02dumptoparsed.py` 需要访问 Minecraft Wiki API
-- `04buildindex.py` 会加载本地或 Hugging Face 模型来生成 Embedding
 
 ## 技术栈
 
@@ -181,37 +233,7 @@ index/meta_all.jsonl
 - Vite
 - FastAPI
 - FAISS CPU
-- Sentence-Transformers
-- Transformers
+- sentence-transformers
+- transformers
 - PyTorch CPU
 - DeepSeek API
-
-## 已知限制
-
-- 当前主要面向 Windows
-- 默认是 CPU 推理，首次启动会有 warmup
-- 回答质量依赖本地索引和 DeepSeek 输出
-- 如果缺少 `index` 文件，后端无法完成检索
-- 若未配置 API Key，只能启动界面，无法生成最终回答
-
-## 构建打包
-
-仓库里已经有一个简单的打包脚本：
-
-```powershell
-.\test.bat
-```
-
-它会执行：
-
-1. `tauri-app` 内的 `npm run tauri build`
-2. 将生成的 EXE 复制到仓库根目录
-3. 直接启动打包产物
-
-## 版本
-
-当前版本号在 [tauri-app/package.json](/c:/minecraft-ass/source/tauri-app/package.json) 和 [tauri-app/src-tauri/tauri.conf.json](/c:/minecraft-ass/source/tauri-app/src-tauri/tauri.conf.json) 中均为：
-
-```text
-0.1.0
-```

@@ -30,7 +30,8 @@ INDEX_PATH = PROJECT_ROOT /"index" / "faiss_all.index"
 META_PATH = PROJECT_ROOT /"index" /"meta_all.jsonl"
 EVIDENCE_FOR_LLM = 30
 EVIDENCE_TEXT_MAX = 600          # 普通段落
-TRADE_EVIDENCE_TEXT_MAX = 2800   # 交易表段落（关键）
+TABLE_EVIDENCE_TEXT_MAX = 2800   # 结构化表格段落
+TRADE_EVIDENCE_TEXT_MAX = TABLE_EVIDENCE_TEXT_MAX
 SECTION2IDXS: Dict[Tuple[str, int], List[int]] = {}
 PIPELINE_LOGGER = logging.getLogger("pipeline")
 _DEEPSEEK_SESSION: Optional[requests.Session] = None
@@ -96,16 +97,42 @@ def _is_trade_line(line: str) -> bool:
     return _is_structured_kv_line(s) and bool(_TRADE_FIELD_HINT_RE.search(s))
 
 
+def _is_table_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    return _is_structured_kv_line(s)
+
+
 def _count_trade_lines(text: str) -> int:
     return sum(1 for ln in (text or "").splitlines() if _is_trade_line(ln))
+
+
+def _count_table_lines(text: str) -> int:
+    return sum(1 for ln in (text or "").splitlines() if _is_table_line(ln))
 
 
 def _has_trade_lines(text: str, min_lines: int = 1) -> bool:
     return _count_trade_lines(text) >= min_lines
 
 
+def _has_table_lines(text: str, min_lines: int = 1) -> bool:
+    return _count_table_lines(text) >= min_lines
+
+
 def _is_trade_section_hint(text: str) -> bool:
     return bool(_TRADE_SECTION_HINT_RE.search(text or ""))
+
+
+def _find_table_anchor_pos(text: str) -> Optional[int]:
+    cursor = 0
+    for raw in (text or "").splitlines(True):
+        line = raw.rstrip("\r\n")
+        stripped = line.strip()
+        if stripped and _is_table_line(stripped):
+            return cursor + max(0, line.find(stripped))
+        cursor += len(raw)
+    return None
 
 
 def _find_trade_anchor_pos(text: str) -> Optional[int]:
@@ -135,6 +162,33 @@ def _is_trade_evidence(ev: Dict) -> bool:
     if _is_trade_section_hint(sp) or _is_trade_section_hint(st):
         return True
     return False
+
+
+def _is_table_evidence(ev: Dict) -> bool:
+    tx = (ev.get("text") or "")
+    if _has_table_lines(tx):
+        return True
+    return False
+
+
+def _truncate_table_text(tx: str, limit: int) -> str:
+    if len(tx) <= limit:
+        return tx
+
+    anchor = _find_table_anchor_pos(tx)
+    if anchor is None:
+        return tx[:limit] + "…"
+
+    head = tx[:anchor].strip()
+    if len(head) > 180:
+        head = head[:180].rstrip() + "\n…"
+
+    body = tx[anchor:]
+    remain = max(0, limit - len(head) - 1)
+    if remain <= 0:
+        return tx[:limit] + "…"
+    body = body[:remain].rstrip() + "…"
+    return (head + "\n" + body).strip()
 
 def _truncate_trade_text(tx: str, limit: int) -> str:
     """
@@ -301,13 +355,24 @@ def _set_prefixed_timing(timings: Optional[Dict[str, int]], prefix: str, name: s
     timings[key] = int(elapsed_ms)
 
 
-def _log_pipeline_timings(question: str, timings: Dict[str, int]) -> None:
+def _log_pipeline_timings(
+    question: str,
+    timings: Dict[str, int],
+    *,
+    anchors: Optional[List[str]] = None,
+    subquestions: Optional[List[str]] = None,
+) -> None:
     total_ms = int(timings.get("pipeline_total") or sum(v for k, v in timings.items() if isinstance(v, int) and k != "pipeline_total"))
     ordered = {k: timings[k] for k in sorted(timings.keys())}
-    line = "pipeline_timing question=%s total_ms=%s breakdown=%s" % (
+    extras = {
+        "anchors": list(anchors or []),
+        "subquestions": list(subquestions or []),
+    }
+    line = "pipeline_timing question=%s total_ms=%s breakdown=%s analyze=%s" % (
         question[:120],
         total_ms,
         json.dumps(ordered, ensure_ascii=False),
+        json.dumps(extras, ensure_ascii=False),
     )
     PIPELINE_LOGGER.info(line)
     try:
@@ -509,7 +574,7 @@ def postprocess_evidences(
             if isinstance(idx, int):
                 seen_idxs.add(idx)
             picked.append(e)
-    TRADE_MAX = 2800
+    TABLE_MAX = TABLE_EVIDENCE_TEXT_MAX
     GEN_MAX = max_chars_per_evidence  # 仍然默认 600
 
     for e in picked[:max_evidences]:
@@ -518,7 +583,10 @@ def postprocess_evidences(
 
         if _is_trade_evidence(e2):
             # 交易证据：更高上限 + 从第一条交易行开始截断
-            e2["text"] = _truncate_trade_text(tx, TRADE_MAX)
+            e2["text"] = _truncate_trade_text(tx, TABLE_MAX)
+        elif _is_table_evidence(e2):
+            # 其他结构化表格：同样保留完整表体
+            e2["text"] = _truncate_table_text(tx, TABLE_MAX)
         else:
             e2["text"] = _truncate_text_general(tx, GEN_MAX)
 
@@ -623,14 +691,14 @@ def postprocess_evidences(
 def enhance_sections_inplace(
     evidences: List[Dict],
     meta_all_path: Path,
-    only_if_section_contains: str = "交易",
+    only_if_section_contains: str = "",
     max_chars: int = 600,
 ) -> List[Dict]:
     if not evidences:
         return evidences
     init_once()
 
-    # 1) 收集需要增强的 key（只增强“交易”等表格段）
+    # 1) 收集需要增强的 key（增强所有结构化表格段；可选再按章节名过滤）
     keys = []
     seen = set()
     for ev in evidences:
@@ -641,9 +709,9 @@ def enhance_sections_inplace(
         if not u or si is None:
             continue
         if only_if_section_contains:
-            if (only_if_section_contains not in st) and not _is_trade_section_hint(st) and not _has_trade_lines(tx):
+            if (only_if_section_contains not in st) and not _has_table_lines(tx):
                 continue
-        elif not (_is_trade_section_hint(st) or _has_trade_lines(tx)):
+        elif not _has_table_lines(tx):
             continue
         key = (u, int(si))
         if key in seen:
@@ -676,9 +744,9 @@ def enhance_sections_inplace(
                     continue
                 lines.append(ln)
 
-        trade_lines = [ln for ln in lines if _is_trade_line(ln)]
-        if trade_lines:
-            lines = trade_lines
+        table_lines = [ln for ln in lines if _is_table_line(ln)]
+        if table_lines:
+            lines = table_lines
 
         joined = "\n".join(lines)
         if max_chars > 0 and len(joined) > max_chars:
@@ -960,6 +1028,8 @@ def expand_evidence_context(
     *,
     window: int = 2,
     max_chars: int = 600,
+    table_max_chars: Optional[int] = None,
+    trade_max_chars: Optional[int] = None,
     trade_min_lines: int = 16,
     trade_max_scan: int = 80,
 ) -> List[dict]:
@@ -1043,11 +1113,15 @@ def expand_evidence_context(
 
         sec_title = (ev.get("section_title") or "") + " " + (ev.get("section_path") or "")
         is_trade = _is_trade_section_hint(sec_title) or _has_trade_lines(ev.get("text") or "")
+        is_table = is_trade or _has_table_lines(ev.get("text") or "")
 
-        if is_trade:
+        if is_table:
             texts = []
-            trade_lines = 0
+            table_lines = 0
             total_chars = 0
+            limit = trade_max_chars if is_trade and (trade_max_chars is not None) else (
+                table_max_chars if (table_max_chars is not None) else max_chars
+            )
 
             hi = min(len(lst), pos + trade_max_scan)
             for ch in lst[pos:hi]:
@@ -1055,11 +1129,10 @@ def expand_evidence_context(
                 if not t:
                     continue
 
-                trade_lines += _count_trade_lines(t)
+                table_lines += _count_table_lines(t)
 
-                # 控总长度
-                if total_chars + len(t) + 1 > max_chars:
-                    remain = max_chars - total_chars - 1
+                if total_chars + len(t) + 1 > limit:
+                    remain = limit - total_chars - 1
                     if remain > 40:
                         texts.append(t[:remain].rstrip() + "…")
                     break
@@ -1067,7 +1140,7 @@ def expand_evidence_context(
                 texts.append(t)
                 total_chars += len(t) + 1
 
-                if trade_lines >= trade_min_lines:
+                if table_lines >= trade_min_lines:
                     break
 
             joined = "\n".join(texts).strip()
@@ -1093,6 +1166,7 @@ def expand_evidence_context_fast(
     *,
     window: int = 2,
     max_chars: int = 600,
+    table_max_chars: Optional[int] = None,
     trade_max_chars: Optional[int] = None,
     trade_min_lines: int = 16,
     trade_max_scan: int = 80,
@@ -1143,18 +1217,21 @@ def expand_evidence_context_fast(
 
         sec_title = (ev.get("section_title") or "") + " " + (ev.get("section_path") or "")
         is_trade = _is_trade_section_hint(sec_title) or _has_trade_lines(ev.get("text") or "")
+        is_table = is_trade or _has_table_lines(ev.get("text") or "")
 
-        if is_trade:
+        if is_table:
             texts = []
-            trade_lines = 0
+            table_lines = 0
             total_chars = 0
             hi = min(len(idxs), pos + trade_max_scan)
+            limit = trade_max_chars if is_trade and (trade_max_chars is not None) else (
+                table_max_chars if (table_max_chars is not None) else max_chars
+            )
             for midx in idxs[pos:hi]:
                 t = (METAS[midx].get("text") or "").strip()
                 if not t:
                     continue
-                trade_lines += _count_trade_lines(t)
-                limit = trade_max_chars if (trade_max_chars is not None) else max_chars
+                table_lines += _count_table_lines(t)
 
                 if total_chars + len(t) + 1 > limit:
                     remain = limit - total_chars - 1
@@ -1163,7 +1240,7 @@ def expand_evidence_context_fast(
                     break
                 texts.append(t)
                 total_chars += len(t) + 1
-                if trade_lines >= trade_min_lines:
+                if table_lines >= trade_min_lines:
                     break
             joined = "\n".join(texts).strip()
         else:
@@ -2978,6 +3055,8 @@ def build_messages(
 
         if _is_trade_evidence(ev):
             txt = _truncate_trade_text(txt, TRADE_EVIDENCE_TEXT_MAX)
+        elif _is_table_evidence(ev):
+            txt = _truncate_table_text(txt, TABLE_EVIDENCE_TEXT_MAX)
         else:
             if len(txt) > EVIDENCE_TEXT_MAX:
                 txt = txt[:EVIDENCE_TEXT_MAX] + "…"
@@ -3311,7 +3390,7 @@ def pipeline(
     evidences_for_llm,
     META_PATH,
     only_if_section_contains="",
-    max_chars=TRADE_EVIDENCE_TEXT_MAX,  # 交易表更长，直接拉高
+    max_chars=TABLE_EVIDENCE_TEXT_MAX,  # 表格段更长，直接拉高
     )
 
     evidences_for_llm = _timed_call(
@@ -3322,6 +3401,7 @@ def pipeline(
         META_PATH,
         window=2,
         max_chars=EVIDENCE_TEXT_MAX,
+        table_max_chars=TABLE_EVIDENCE_TEXT_MAX,
         trade_max_chars=TRADE_EVIDENCE_TEXT_MAX,
     )
 
@@ -3358,7 +3438,12 @@ def pipeline(
     )
     pipeline_timings["pipeline_total"] = int((time.perf_counter() - pipeline_total_t0) * 1000)
     if debug_mode:
-        _log_pipeline_timings(q, pipeline_timings)
+        _log_pipeline_timings(
+            q,
+            pipeline_timings,
+            anchors=qp.get("anchors", []),
+            subquestions=subquestions,
+        )
     if (config.get("debug_mode")):
         print ("[DEBUG]Details informations of this answer:\n")
         print ("[DEBUG]mode:",mode,'\n')
