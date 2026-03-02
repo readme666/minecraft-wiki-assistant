@@ -42,13 +42,23 @@ function Invoke-Python {
 function Get-PythonVersion {
     param([string]$PythonCommand)
 
-    $script = 'import sys; print("%d.%d.%d" % sys.version_info[:3])'
-    $output = Invoke-Python -PythonCommand $PythonCommand -Arguments @("-c", $script) 2>$null
+    if ($PythonCommand -eq "py") {
+        $output = & py -3 --version 2>$null
+    } else {
+        $output = & $PythonCommand --version 2>$null
+    }
+
     if ($LASTEXITCODE -ne 0 -or -not $output) {
         throw "Failed to detect Python version."
     }
 
-    return [Version]($output | Select-Object -First 1)
+    $versionText = ($output | Select-Object -First 1)
+    $match = [regex]::Match($versionText, '(\d+)\.(\d+)\.(\d+)')
+    if (-not $match.Success) {
+        throw "Failed to parse Python version from output: $versionText"
+    }
+
+    return [Version]$match.Value
 }
 
 function Assert-MinimumPythonVersion {
