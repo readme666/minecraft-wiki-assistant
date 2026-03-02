@@ -1230,6 +1230,7 @@ def _drain_completed(
 
 def main():
     n = 0
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     with OUT_FILE.open("w", encoding="utf-8") as fout, \
          TITLES_FILE.open("w", encoding="utf-8", newline="\n") as ftitles:
