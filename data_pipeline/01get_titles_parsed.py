@@ -3,9 +3,11 @@ import random
 import re
 import requests
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 import time
-from urllib.parse import unquote, urlparse
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from urllib.parse import quote, unquote, urlparse
 try:
     from bs4 import BeautifulSoup, NavigableString, Tag
     _HAS_BS4 = True
@@ -26,8 +28,8 @@ from collections import OrderedDict
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-IN_FILE = DATA_DIR / "data_dump.jsonl"
 OUT_FILE = DATA_DIR / "data_parsed.jsonl"
+TITLES_FILE = DATA_DIR / "titles.txt"
 EXPAND_CACHE_FILE = Path("expand_cache.jsonl")   # 可选：不想落盘就注释掉相关写入/读取
 EXPAND_CACHE_MAX = 5000                          # 内存最多缓存条目数（可调）
 _expand_cache: OrderedDict[str, str] = OrderedDict()
@@ -82,18 +84,20 @@ def _expand_cache_append(k: str, v: str) -> None:
 
 
 def _parse_cache_get(k: str) -> Optional[Dict]:
-    v = _parse_cache.get(k)
-    if v is None:
-        return None
-    _parse_cache.move_to_end(k)
-    return v
+    with _parse_cache_lock:
+        v = _parse_cache.get(k)
+        if v is None:
+            return None
+        _parse_cache.move_to_end(k)
+        return v
 
 
 def _parse_cache_put(k: str, v: Dict) -> None:
-    _parse_cache[k] = v
-    _parse_cache.move_to_end(k)
-    if len(_parse_cache) > PARSE_CACHE_MAX:
-        _parse_cache.popitem(last=False)
+    with _parse_cache_lock:
+        _parse_cache[k] = v
+        _parse_cache.move_to_end(k)
+        if len(_parse_cache) > PARSE_CACHE_MAX:
+            _parse_cache.popitem(last=False)
 
 
 def _parse_cache_load() -> None:
@@ -112,11 +116,12 @@ def _parse_cache_load() -> None:
 
 
 def _parse_cache_append(k: str, v: Dict) -> None:
-    try:
-        with PARSE_CACHE_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"k": k, "v": v}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    with _parse_cache_lock:
+        try:
+            with PARSE_CACHE_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"k": k, "v": v}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 # 程序启动时加载一次（想禁用磁盘缓存就把这一行注释掉）
 _expand_cache_load()
@@ -130,10 +135,110 @@ from functools import lru_cache
 WIKI_API = "https://zh.minecraft.wiki/api.php"
 API_URL = "https://zh.minecraft.wiki/api.php"
 UA = "local-rag/0.1 (contact: you@example.com)"
+NAMESPACES = [0, 9998]
+SKIP_REDIRECTS = True
+LIST_SLEEP = 0.2
+PAGE_SLEEP = 0.05
+API_RETRIES = 5
+API_BACKOFF = 1.6
+API_TIMEOUT = 60
+MAX_WORKERS = 6
+MAX_PENDING = MAX_WORKERS * 4
+_thread_local = threading.local()
+_parse_cache_lock = threading.Lock()
 SESSION.headers.update({
     "User-Agent": UA,
     "Accept": "application/json",
 })
+
+
+def _get_session() -> requests.Session:
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": UA,
+            "Accept": "application/json",
+        })
+        _thread_local.session = session
+    return session
+
+
+def _request_json(params: Dict[str, object], *, timeout: int = API_TIMEOUT) -> Dict:
+    last: Optional[Exception] = None
+    session = _get_session()
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            r = session.get(API_URL, params=params, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            last = e
+            wait_s = (API_BACKOFF ** (attempt - 1)) * LIST_SLEEP
+            try:
+                resp = getattr(e, "response", None)
+                if resp is not None and getattr(resp, "status_code", None) == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        wait_s = max(wait_s, float(retry_after))
+            except Exception:
+                pass
+            if attempt >= API_RETRIES:
+                break
+            time.sleep(wait_s)
+        except Exception as e:
+            last = e
+            break
+    raise RuntimeError(f"API request failed: {last}")
+
+
+def _normalize_output_title(title: str) -> str:
+    if title.startswith("Tutorial:"):
+        return title[len("Tutorial:"):]
+    if title.startswith("教程:"):
+        return title[len("教程:"):]
+    return title
+
+
+def iter_allpages_titles() -> Iterator[str]:
+    seen: set[str] = set()
+    for ns in NAMESPACES:
+        print(f">>> listing namespace {ns}")
+        apcontinue: Optional[str] = None
+        page = 0
+        while True:
+            params: Dict[str, object] = {
+                "action": "query",
+                "format": "json",
+                "list": "allpages",
+                "apnamespace": str(ns),
+                "aplimit": "max",
+            }
+            if SKIP_REDIRECTS:
+                params["apfilterredir"] = "nonredirects"
+            if apcontinue:
+                params["apcontinue"] = apcontinue
+
+            data = _request_json(params)
+            items = data.get("query", {}).get("allpages", [])
+            page += 1
+            added = 0
+
+            for item in items:
+                title = (item.get("title") or "").strip()
+                if not title or title in seen:
+                    continue
+                seen.add(title)
+                added += 1
+                yield title
+
+            print(f"  [NS:{ns}] page={page:4d} got={len(items):4d} added={added:4d} total={len(seen):6d}")
+            apcontinue = data.get("continue", {}).get("apcontinue")
+            time.sleep(LIST_SLEEP)
+            if not apcontinue:
+                break
 
 
 def _resolve_api_title(obj: Dict) -> str:
@@ -952,6 +1057,57 @@ def clean_wikitext(text: str, append_meta: bool = True) -> str:
     return txt
 
 
+def _split_sections_from_wikitext(wikitext: str) -> List[Dict]:
+    sections: List[Dict] = []
+    current_title = "导言"
+    current_level = 1
+    current_parent = None
+    current_path = "导言"
+    buf: List[str] = []
+    stack: List[Tuple[str, int]] = []
+    path_stack: List[str] = []
+
+    def flush() -> None:
+        nonlocal buf
+        text = "\n".join(buf).strip()
+        if text:
+            sections.append(
+                {
+                    "title": current_title,
+                    "level": current_level,
+                    "parent": current_parent,
+                    "path": current_path,
+                    "text": text,
+                }
+            )
+        buf = []
+
+    for line in wikitext.splitlines():
+        match = re.match(r"^(=+)\s*(.*?)\s*\1\s*$", line)
+        if not match:
+            buf.append(line)
+            continue
+
+        flush()
+        level = len(match.group(1))
+        title = match.group(2).strip()
+
+        while stack and stack[-1][1] >= level:
+            stack.pop()
+            if path_stack:
+                path_stack.pop()
+
+        current_parent = stack[-1][0] if stack else None
+        current_title = title
+        current_level = level
+        current_path = "/".join(path_stack + [title]) if path_stack else title
+        stack.append((title, level))
+        path_stack.append(title)
+
+    flush()
+    return sections
+
+
 def _convert_sections(page_title: str, sections) -> List[Dict]:
     if not isinstance(sections, list):
         return []
@@ -981,51 +1137,119 @@ def _convert_sections(page_title: str, sections) -> List[Dict]:
         )
     return out
 
+
+def fetch_page_record(page_title: str) -> Optional[Dict]:
+    cache_key = f"page::{page_title}"
+    cached = _parse_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    params: Dict[str, object] = {
+        "action": "parse",
+        "format": "json",
+        "page": page_title,
+        "prop": "text|wikitext|displaytitle|revid",
+        "redirects": 1,
+        "disableeditsection": 1,
+        "disablelimitreport": 1,
+        "disabletoc": 1,
+    }
+
+    try:
+        data = _request_json(params)
+    except Exception as e:
+        print(f"  fetch failed {page_title}: {e}")
+        return None
+
+    parsed = data.get("parse") or {}
+    resolved_title = (parsed.get("title") or page_title).strip()
+    display_title = (parsed.get("displaytitle") or resolved_title).strip()
+    html = (((parsed.get("text") or {}).get("*")) or "").strip()
+    raw = (((parsed.get("wikitext") or {}).get("*")) or "").strip()
+
+    sections: List[Dict] = []
+    text = ""
+
+    if html and _HAS_BS4:
+        sections = _html_to_sections(html)
+        text = _sections_to_page_text(sections)
+
+    if not text and raw:
+        text = clean_wikitext(raw)
+        sections = _convert_sections(resolved_title, _split_sections_from_wikitext(raw))
+
+    if not text:
+        return None
+
+    rec = {
+        "title": _normalize_output_title(resolved_title),
+        "url": f"https://zh.minecraft.wiki/wiki/{quote(resolved_title)}",
+        "text": text,
+        "redirect_targets": _extract_for_targets(raw),
+        "sections": sections,
+        "source_title": page_title,
+        "display_title": display_title,
+    }
+    _parse_cache_put(cache_key, rec)
+    _parse_cache_append(cache_key, rec)
+    return rec
+
+
+def _drain_completed(
+    pending: Dict[Future, str],
+    fout,
+    *,
+    block: bool,
+) -> int:
+    if not pending:
+        return 0
+
+    timeout = None if block else 0
+    done, _ = wait(pending.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
+    written = 0
+    for future in done:
+        page_title = pending.pop(future)
+        try:
+            rec = future.result()
+        except Exception as e:
+            print(f"  worker failed {page_title}: {e}")
+            continue
+
+        if rec is None:
+            continue
+
+        fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        written += 1
+    return written
+
+
 def main():
     n = 0
 
-    with IN_FILE.open(encoding="utf-8") as fin, \
-         OUT_FILE.open("w", encoding="utf-8") as fout:
+    with OUT_FILE.open("w", encoding="utf-8") as fout, \
+         TITLES_FILE.open("w", encoding="utf-8", newline="\n") as ftitles:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            pending: Dict[Future, str] = {}
 
-        for line_no, line in enumerate(fin, 1):
-            obj = json.loads(line)
-            title = obj.get("title", "")
-            api_title = _resolve_api_title(obj)
+            for idx, page_title in enumerate(iter_allpages_titles(), 1):
+                ftitles.write(page_title + "\n")
 
-            if line_no % 50 == 0:
-                print(f"[{line_no}] processing: {title}")
+                if idx % 50 == 0:
+                    print(f"[{idx}] queued: {page_title} pending={len(pending)}")
 
-            raw = obj.get("wikitext") or ""
+                pending[executor.submit(fetch_page_record, page_title)] = page_title
 
-            t1 = time.time()
-            parsed = parse_wikitext_via_api(api_title, raw)
-            print(f"  parse  {title}  {time.time()-t1:.2f}s  ok={parsed is not None}")
+                if len(pending) >= MAX_PENDING:
+                    n += _drain_completed(pending, fout, block=True)
 
-            if parsed is not None:
-                cleaned = parsed.get("text") or ""
-                sections = parsed.get("sections") or []
-            else:
-                t2 = time.time()
-                raw_exp = expand_templates(api_title, raw)
-                print(f"  expand {title}  {time.time()-t2:.2f}s  len={len(raw_exp)}")
+                if PAGE_SLEEP > 0:
+                    time.sleep(PAGE_SLEEP)
 
-                t3 = time.time()
-                cleaned = clean_wikitext(raw_exp)
-                sections = _convert_sections(api_title, obj.get("sections"))
-                print(f"  clean  {title}  {time.time()-t3:.2f}s  len={len(cleaned)}")
-
-            rec = {
-                "title": obj["title"],
-                "url": obj["url"],
-                "text": cleaned,
-                "redirect_targets": _extract_for_targets(raw),  # raw 或 raw_exp 都行；看你想提取“原始重定向模板”还是展开后的
-                "sections": sections,
-            }
-
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            n += 1
+            while pending:
+                n += _drain_completed(pending, fout, block=True)
 
     print(f"\u2705 \u5b8c\u6210: {OUT_FILE} pages={n}")
+    print(f"\u2705 titles: {TITLES_FILE}")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,18 @@ const cfgInputMiss = document.getElementById("cfgInputMiss");
 const cfgOutput = document.getElementById("cfgOutput");
 const cfgFontSize = document.getElementById("cfgFontSize");
 const MODEL_OPTIONS = ["deepseek-chat", "deepseek-reasoner"];
+const FALLBACK_EMPTY_STATE_WIKI_TITLES = [
+  "红石电路",
+  "附魔",
+  "村民",
+  "酿造",
+  "下界",
+  "末地",
+  "命令",
+  "进度",
+  "生物群系",
+  "合成"
+];
 
 let sessionId = "default";
 let sessions = [];
@@ -62,6 +74,8 @@ let animatedSessionId = null;
 let currentView = "chat";
 let viewTransitionTimer = null;
 let isViewTransitioning = false;
+let emptyStateWikiLinks = [];
+let wikiTitlePool = [];
 const SETTINGS_MODAL_ANIMATION_MS = 420;
 const SETTINGS_MODAL_CONTENT_FADE_MS = 260;
 
@@ -105,10 +119,12 @@ function clearSettingsModalMorphEl() {
 function setSettingsOriginVisibility(hidden) {
   if (!settingsModalOriginEl) return;
   if (hidden) {
+    settingsModalOriginEl.classList.add("morph-origin-lock");
     settingsModalOriginEl.style.visibility = "hidden";
     settingsModalOriginEl.style.pointerEvents = "none";
     return;
   }
+  settingsModalOriginEl.classList.add("morph-origin-lock");
   settingsModalOriginEl.style.removeProperty("visibility");
   settingsModalOriginEl.style.removeProperty("pointer-events");
 }
@@ -121,6 +137,7 @@ function clearSettingsModalAnimationState() {
   settingsModalContent?.style.removeProperty("pointer-events");
   settingsModalTitle?.style.removeProperty("opacity");
   setSettingsOriginVisibility(false);
+  settingsModalOriginEl?.classList.remove("morph-origin-lock");
   clearSettingsModalMorphEl();
 }
 
@@ -466,7 +483,7 @@ function animateSettingsModalMorph(direction, originEl, onFinish) {
       if (settingsModalAnimation !== animationHandle) return;
       setSettingsOriginVisibility(false);
       settingsModalOriginRevealTimer = null;
-    }, SETTINGS_MODAL_ANIMATION_MS - 70);
+    }, SETTINGS_MODAL_ANIMATION_MS - 110);
   }
 
   Promise.allSettled(
@@ -662,7 +679,7 @@ marked.setOptions({
 
 const SAFE_URI = /^(https?:|mailto:)/i;
 const MAX_SESSION_TITLE = 20;
-const DEFAULT_APP_TITLE = "Minecraft Wiki 助手";
+const DEFAULT_APP_TITLE = "MineRAG";
 const VIEW_TRANSITION_MS = 520;
 
 function shortText(text, maxLen = MAX_SESSION_TITLE) {
@@ -697,6 +714,53 @@ function saveSessions() {
 function startDraftSession() {
   draftSession = createSession("新会话");
   sessionId = draftSession.id;
+  emptyStateWikiLinks = pickRandomWikiLinks();
+}
+
+function titleToWikiLink(title) {
+  const normalized = String(title || "").trim().replace(/\s+/g, "_");
+  return `https://zh.minecraft.wiki/w/${encodeURIComponent(normalized)}`;
+}
+
+function isDisplayableWikiTitle(title) {
+  const t = String(title || "").trim();
+  if (!t) return false;
+  if (t.length < 2 || t.length > 40) return false;
+  if (/\d/.test(t)) return false;
+
+  // Hide dotfiles, paths, subpages, and namespaced maintenance pages.
+  if (t.startsWith(".") || t.includes("\\") || t.includes("/") || t.includes(":")) return false;
+
+  // Filter version numbers / snapshots / obviously technical identifiers.
+  if (/^\d+(?:\.\d+)+[a-z0-9-]*$/i.test(t)) return false;
+  if (/^\d+[a-z]?w\d+[a-z]?$/i.test(t)) return false;
+  if (/^pre-?\d+$/i.test(t) || /^rc\d+$/i.test(t)) return false;
+  if (/^[\d.xXa-fA-F-]+$/.test(t)) return false;
+
+  // Drop noisy maintenance / format / test pages that are poor homepage suggestions.
+  if (/(格式|规范|列表|历史文件|存储格式|定义格式|测试|FAQ|教程)$/u.test(t)) return false;
+  if (/(版本|快照|测试版|预发布版|候选版)$/u.test(t)) return false;
+  if (/(消歧义|娑堟涔夛級|娑堟涔夛?)/u.test(t)) return false;
+
+  return true;
+}
+
+async function loadWikiTitlePool() {
+  try {
+    const res = await fetch("/titles.txt", { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const raw = await res.text();
+    const titles = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(isDisplayableWikiTitle);
+    wikiTitlePool = Array.from(new Set(titles));
+  } catch (err) {
+    console.error("加载 titles.txt 失败:", err);
+    wikiTitlePool = [];
+  }
 }
 
 function loadSessions() {
@@ -843,7 +907,7 @@ function deleteSession(sessionToDeleteId) {
   const deletingActive = sessionId === sessionToDeleteId;
   sessions.splice(idx, 1);
 
-  if (sessions.length === 0) {
+  if (deletingActive && sessions.length === 0) {
     startDraftSession();
   } else if (deletingActive) {
     const fallback = sessions[idx] || sessions[idx - 1] || sessions[0];
@@ -853,8 +917,10 @@ function deleteSession(sessionToDeleteId) {
 
   saveSessions();
   renderSessionList();
-  const current = getCurrentSession();
-  renderChatMessages(current?.messages || []);
+  if (deletingActive) {
+    const current = getCurrentSession();
+    renderChatMessages(current?.messages || []);
+  }
   syncAppTitle();
 }
 
@@ -875,6 +941,11 @@ function animateSessionDeletion(item, sessionToDeleteId) {
 }
 
 function renderAssistantFinalBubble(bubble, msg) {
+  renderAssistantMarkdownBubble(bubble, msg, { includeMeta: true });
+}
+
+function renderAssistantMarkdownBubble(bubble, msg, options = {}) {
+  const { includeMeta = false } = options;
   const html = marked.parse(msg.text || "(无回答)");
   const clean = DOMPurify.sanitize(html, {
     ALLOWED_URI_REGEXP: SAFE_URI,
@@ -883,27 +954,49 @@ function renderAssistantFinalBubble(bubble, msg) {
   bubble.innerHTML = clean;
   bubble.classList.add("markdown-body");
 
-  const refs = renderReferences(msg.evidences_for_llm || []);
-  if (refs) {
-    bubble.appendChild(refs);
-  }
+  if (includeMeta) {
+    const refs = renderReferences(msg.evidences_for_llm || []);
+    if (refs) {
+      bubble.appendChild(refs);
+    }
 
-  if (msg.token_usage || msg.timing_ms) {
-    const footer = document.createElement("div");
-    footer.className = "footer";
-    const timing = msg.timing_ms || {};
-    const token = msg.token_usage || {};
-    footer.textContent =
-      `耗时 ${timing.total || 0}ms | ` +
-      `prompt ${Number(token.prompt_tokens || 0).toFixed(2)} tok | ` +
-      `completion ${Number(token.completion_tokens || 0).toFixed(2)} tok | ` +
-      `期望成本 ¥${Number(token.total_expected || 0).toFixed(6)}`;
-    bubble.appendChild(footer);
+    if (msg.token_usage || msg.timing_ms) {
+      const footer = document.createElement("div");
+      footer.className = "footer";
+      const timing = msg.timing_ms || {};
+      const token = msg.token_usage || {};
+      footer.textContent =
+        `耗时 ${timing.total || 0}ms | ` +
+        `prompt ${Number(token.prompt_tokens || 0).toFixed(2)} tok | ` +
+        `completion ${Number(token.completion_tokens || 0).toFixed(2)} tok | ` +
+        `期望成本 ¥${Number(token.total_expected || 0).toFixed(6)}`;
+      bubble.appendChild(footer);
+    }
   }
 }
 
-function renderChatMessages(messages = []) {
+function renderChatMessages(messages = [], options = {}) {
+  const { animateEmptyState = false } = options;
   chatList.innerHTML = "";
+  chatList.classList.toggle("chat-empty", messages.length === 0);
+  if (messages.length === 0) {
+    const emptyState = createEmptyState();
+    if (animateEmptyState && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      chatList.classList.add("chat-empty-enter");
+      emptyState.classList.add("empty-state-enter");
+      requestAnimationFrame(() => {
+        chatList.classList.add("chat-empty-enter-active");
+        emptyState.classList.add("empty-state-enter-active");
+      });
+      window.setTimeout(() => {
+        chatList.classList.remove("chat-empty-enter", "chat-empty-enter-active");
+        emptyState.classList.remove("empty-state-enter", "empty-state-enter-active");
+      }, 420);
+    } else {
+      chatList.classList.remove("chat-empty-enter", "chat-empty-enter-active");
+    }
+    chatList.appendChild(emptyState);
+  }
   for (const msg of messages) {
     const row = createMessageRow(msg.role, msg.text || "", msg.status || "normal", false);
     if (msg.role === "assistant" && msg.status === "normal") {
@@ -912,6 +1005,88 @@ function renderChatMessages(messages = []) {
   }
   nearBottom = true;
   scrollToBottomIfNeeded();
+}
+
+function pickRandomWikiLinks(count = 4) {
+  const titlePool = wikiTitlePool.length > 0 ? wikiTitlePool : FALLBACK_EMPTY_STATE_WIKI_TITLES;
+  const pool = [...titlePool];
+  for (let i = pool.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, count).map((title) => ({
+    title,
+    url: titleToWikiLink(title)
+  }));
+}
+
+function buildEmptyStateWikiLinks(linkList) {
+  if (!linkList) return;
+  linkList.innerHTML = "";
+  const links = emptyStateWikiLinks.length > 0 ? emptyStateWikiLinks : pickRandomWikiLinks();
+  emptyStateWikiLinks = links;
+
+  for (const item of links) {
+    const link = document.createElement("a");
+    link.className = "empty-state-link";
+    link.href = item.url;
+    link.textContent = item.title;
+    link.title = item.url;
+    attachLiquidPointerTracking(link);
+    link.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await open(item.url);
+      } catch (err) {
+        console.error("打开链接失败:", err);
+        setStatus("Error: 无法打开链接");
+      }
+    });
+    linkList.appendChild(link);
+  }
+}
+
+function createEmptyState() {
+  const wrap = document.createElement("section");
+  wrap.className = "empty-state";
+  attachLiquidPointerTracking(wrap);
+
+  const badge = document.createElement("p");
+  badge.className = "empty-state-eyebrow";
+  badge.textContent = "MineRAG";
+
+  const title = document.createElement("h2");
+  title.className = "empty-state-title";
+  title.textContent = "你好，今天想查点什么？";
+
+  const desc = document.createElement("p");
+  desc.className = "empty-state-desc";
+  desc.textContent = "你可以直接提问，也可以先随便逛几篇 Wiki，看看有没有感兴趣的内容。";
+
+  const actions = document.createElement("div");
+  actions.className = "empty-state-actions";
+
+  const refreshBtn = document.createElement("button");
+  refreshBtn.type = "button";
+  refreshBtn.className = "empty-state-refresh";
+  refreshBtn.textContent = "换一批";
+  attachLiquidPointerTracking(refreshBtn);
+
+  const linkList = document.createElement("div");
+  linkList.className = "empty-state-links";
+  buildEmptyStateWikiLinks(linkList);
+
+  refreshBtn.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    emptyStateWikiLinks = pickRandomWikiLinks();
+    buildEmptyStateWikiLinks(linkList);
+  });
+
+  actions.appendChild(refreshBtn);
+  wrap.append(badge, title, desc, actions, linkList);
+  return wrap;
 }
 
 function renderSessionList() {
@@ -997,6 +1172,9 @@ chatList.addEventListener("click", async (e) => {
   
   // 如果点的是链接，并且有 href 属性
   if (a && a.href) {
+    if (a.classList.contains("empty-state-link")) {
+      return;
+    }
     e.preventDefault(); // 阻止 WebView 默认的“在应用内跳转”行为
     try {
       // 使用 Tauri 的 shell plugin 调用系统默认浏览器打开外部链接
@@ -1300,7 +1478,14 @@ async function writeTextToClipboard(text) {
   }
 }
 
+function clearEmptyStateUI() {
+  chatList.classList.remove("chat-empty");
+  chatList.querySelector(".empty-state")?.remove();
+}
+
 function createMessageRow(role, text, status, animate = true) {
+  clearEmptyStateUI();
+
   const row = document.createElement("div");
   row.className = `message-row ${role}`;
 
@@ -1576,6 +1761,24 @@ async function sendMessage() {
   let retried = false;
   let es = null;
   let streamedAnswerText = "";
+  let streamRenderScheduled = false;
+
+  const flushStreamingMarkdown = () => {
+    streamRenderScheduled = false;
+    if (sessionId !== requestSessionId) {
+      return;
+    }
+    renderAssistantMarkdownBubble(assistantMsg.bubble, { text: streamedAnswerText || "(无回答)" });
+    scrollToBottomIfNeeded();
+  };
+
+  const scheduleStreamingMarkdownRender = () => {
+    if (streamRenderScheduled) {
+      return;
+    }
+    streamRenderScheduled = true;
+    window.requestAnimationFrame(flushStreamingMarkdown);
+  };
 
   const ensureStreamingBubble = () => {
     if (!assistantMsg.bubble.classList.contains("thinking")) {
@@ -1583,7 +1786,7 @@ async function sendMessage() {
     }
     animateThinkingToFinalBubble(assistantMsg.bubble, () => {
       removeThinking(assistantMsg.bubble);
-      assistantMsg.bubble.textContent = streamedAnswerText;
+      renderAssistantMarkdownBubble(assistantMsg.bubble, { text: streamedAnswerText || "(无回答)" });
     });
   };
 
@@ -1633,8 +1836,7 @@ async function sendMessage() {
         }
 
         ensureStreamingBubble();
-        assistantMsg.bubble.textContent = streamedAnswerText;
-        scrollToBottomIfNeeded();
+        scheduleStreamingMarkdownRender();
       } catch (_) {}
     });
 
@@ -1903,7 +2105,7 @@ newSessionBtn?.addEventListener("click", () => {
     setCurrentView("chat");
   }
   renderSessionList();
-  renderChatMessages([]);
+  renderChatMessages([], { animateEmptyState: true });
   syncAppTitle();
   autoResizeInput();
 });
@@ -1928,13 +2130,14 @@ async function waitBackendReady() {
   setStatus("Backend not responding");
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll(".sidebar, .main").forEach(attachLiquidPointerTracking);
   document.querySelectorAll(".btn, .input-bar").forEach(attachLiquidPointerTracking);
   document
     .querySelectorAll(".modal-content, .form input, .form select")
     .forEach(attachLiquidPointerTracking);
   document.querySelectorAll(".about-card").forEach(attachLiquidPointerTracking);
+  await loadWikiTitlePool();
   loadSessions();
   renderSessionList();
   const current = getCurrentSession();
