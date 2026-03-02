@@ -3,7 +3,7 @@ import random
 import re
 import requests
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 import time
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -48,7 +48,7 @@ def _expand_cache_key(title: str, text: str) -> str:
     h.update(text.encode("utf-8"))
     return h.hexdigest()
 
-def _expand_cache_get(k: str) -> str | None:
+def _expand_cache_get(k: str) -> Optional[str]:
     v = _expand_cache.get(k)
     if v is None:
         return None
@@ -203,7 +203,7 @@ def _normalize_output_title(title: str) -> str:
 
 
 def iter_allpages_titles() -> Iterator[str]:
-    seen: set[str] = set()
+    seen: Set[str] = set()
     for ns in NAMESPACES:
         print(f">>> listing namespace {ns}")
         apcontinue: Optional[str] = None
@@ -895,7 +895,7 @@ def clean_wikitext(text: str, append_meta: bool = True) -> str:
             s = s.replace("–", "-").replace("—", "-")
             return s
 
-        def _tpl_args_kv(tpl, limit: int = 12) -> list[tuple[str, str]]:
+        def _tpl_args_kv(tpl, limit: int = 12) -> List[Tuple[str, str]]:
             """返回 (key, value) 列表；key 可能是 '1','2' 或具名参数。"""
             out = []
             try:
@@ -977,7 +977,7 @@ def clean_wikitext(text: str, append_meta: bool = True) -> str:
                 return f"模板:{name} " + " ".join(parts)
             return f"模板:{name}"
 
-        def _render_tpl_semantic(tpl) -> str | None:
+        def _render_tpl_semantic(tpl) -> Optional[str]:
             """少数高价值模板：输出更可读的一行。返回 None 表示不命中，交给 fallback。"""
             name = _tpl_name(tpl).lower()
 
@@ -1005,9 +1005,14 @@ def clean_wikitext(text: str, append_meta: bool = True) -> str:
                 sid = kv.get("id", "")
                 sub = kv.get("subtitle", "")
                 parts = []
-                if desc: parts.append(f"desc={re.sub(r'\\s+', ' ', desc).strip()}")
-                if sid: parts.append(f"id={sid}")
-                if sub: parts.append(f"subtitle={re.sub(r'\\s+', ' ', sub).strip()}")
+                if desc:
+                    desc_clean = re.sub(r"\s+", " ", desc).strip()
+                    parts.append("desc=" + desc_clean)
+                if sid:
+                    parts.append("id=" + sid)
+                if sub:
+                    sub_clean = re.sub(r"\s+", " ", sub).strip()
+                    parts.append("subtitle=" + sub_clean)
                 if parts:
                     return "音效: " + " ".join(parts)
                 return None

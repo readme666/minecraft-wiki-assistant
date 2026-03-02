@@ -39,6 +39,32 @@ function Invoke-Python {
     & $PythonCommand @Arguments
 }
 
+function Get-PythonVersion {
+    param([string]$PythonCommand)
+
+    $script = 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}")'
+    $output = Invoke-Python -PythonCommand $PythonCommand -Arguments @("-c", $script) 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $output) {
+        throw "Failed to detect Python version."
+    }
+
+    return [Version]($output | Select-Object -First 1)
+}
+
+function Assert-MinimumPythonVersion {
+    param(
+        [string]$PythonCommand,
+        [Version]$MinimumVersion = [Version]"3.10.0"
+    )
+
+    $currentVersion = Get-PythonVersion -PythonCommand $PythonCommand
+    if ($currentVersion -lt $MinimumVersion) {
+        throw "Python $($MinimumVersion.ToString(2))+ is required. Current version: $currentVersion. Install Python 3.10 or newer, then rerun this script."
+    }
+
+    Write-Host "Using Python $currentVersion" -ForegroundColor DarkGray
+}
+
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $tauriAppDir = Join-Path $repoRoot "tauri-app"
 $requirementsPath = Join-Path $repoRoot "pyserver\requirements.txt"
@@ -56,6 +82,8 @@ $pythonCommand = Find-PythonCommand
 if (-not $pythonCommand) {
     Write-Error "Python was not found in PATH. Install Python first, then rerun this script."
 }
+
+Assert-MinimumPythonVersion -PythonCommand $pythonCommand
 
 foreach ($tool in @("npm")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {

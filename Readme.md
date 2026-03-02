@@ -68,6 +68,20 @@ MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 - Node.js 18+
 - Rust / Cargo
 
+注意：本项目的 Python 依赖包含 `sentence-transformers`、`torch`、`faiss-cpu` 等包，实际要求也是 Python 3.10 或更高版本。Python 3.9 及以下即使部分脚本能运行，也无法完整安装和运行整个项目。
+
+可以先执行下面的命令确认版本：
+
+```powershell
+python --version
+```
+
+或：
+
+```powershell
+py -3 --version
+```
+
 ### 安装依赖
 
 安装 Python 依赖：
@@ -75,6 +89,8 @@ MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 ```powershell
 pip install -r pyserver/requirements.txt
 ```
+
+如果版本低于 Python 3.10，请先升级 Python，再安装依赖。
 
 安装前端依赖：
 
@@ -99,10 +115,11 @@ npm run tauri dev
 它会自动完成以下步骤：
 
 1. 检查 `Python` 和 `npm` 是否可用
-2. 安装 `pyserver/requirements.txt` 中的 Python 依赖
-3. 运行数据构建脚本
-4. 在 `tauri-app` 下执行 `npm run tauri build`
-5. 将生成的 `MineRAG.exe` 复制到仓库根目录
+2. 检查 Python 版本是否至少为 `3.10`
+3. 安装 `pyserver/requirements.txt` 中的 Python 依赖
+4. 运行数据构建脚本
+5. 在 `tauri-app` 下执行 `npm run tauri build`
+6. 将生成的 `MineRAG.exe` 复制到仓库根目录
 
 运行方式：
 
@@ -110,7 +127,7 @@ npm run tauri dev
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-如果系统中没有 Python，脚本会直接提示并退出。
+如果系统中没有 Python，或 Python 版本低于 3.10，脚本会直接提示并退出。
 
 ## 数据构建流程
 
