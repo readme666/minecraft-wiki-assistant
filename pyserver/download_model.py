@@ -1,11 +1,10 @@
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download
 from tqdm.auto import tqdm
 
 MODEL_REPO_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -50,7 +49,6 @@ def format_error(exc: BaseException) -> str:
 
 class AggregateProgressTqdm(tqdm):
     total_bytes: int = 0
-    completed_bytes: int = 0
     current_file: str = ""
     current_file_base: int = 0
     current_file_emitted: int = 0
@@ -59,7 +57,6 @@ class AggregateProgressTqdm(tqdm):
     def configure(cls, file_name: str, total_bytes: int, completed_bytes: int) -> None:
         cls.current_file = file_name
         cls.total_bytes = total_bytes
-        cls.completed_bytes = completed_bytes
         cls.current_file_base = completed_bytes
         cls.current_file_emitted = completed_bytes
 
@@ -78,26 +75,30 @@ class AggregateProgressTqdm(tqdm):
         return result
 
 
+def load_file_sizes() -> dict[str, int]:
+    info = HfApi().model_info(MODEL_REPO_ID, files_metadata=True)
+    sizes: dict[str, int] = {}
+    for sibling in info.siblings:
+        name = getattr(sibling, "rfilename", None)
+        if not name:
+            continue
+        sizes[name] = int(getattr(sibling, "size", 0) or 0)
+    return sizes
+
+
 def main() -> int:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    dry_run_infos = []
+    file_size_map = load_file_sizes()
     total_bytes = 0
     completed_bytes = 0
 
     emit("status", message="正在检查模型文件...")
     for file_name in MODEL_FILES:
-        info = hf_hub_download(
-            repo_id=MODEL_REPO_ID,
-            filename=file_name,
-            dry_run=True,
-            local_dir=str(MODEL_DIR),
-        )
-        dry_run_infos.append(info)
-        file_size = int(info.file_size or 0)
+        file_size = file_size_map.get(file_name, 0)
         total_bytes += file_size
-        if not info.will_download:
+        if (MODEL_DIR / file_name).exists():
             completed_bytes += file_size
 
     emit(
@@ -107,17 +108,13 @@ def main() -> int:
         file_count=len(MODEL_FILES),
     )
 
-    for info in dry_run_infos:
-        file_name = info.filename
-        file_size = int(info.file_size or 0)
+    for file_name in MODEL_FILES:
+        file_size = file_size_map.get(file_name, 0)
         target_path = MODEL_DIR / file_name
         ensure_parent(target_path)
 
-        if not info.will_download:
+        if target_path.exists():
             emit("status", message=f"正在准备 {file_name} ...")
-            cached_path = Path(info.local_path)
-            if not target_path.exists() and cached_path.exists():
-                shutil.copy2(cached_path, target_path)
             emit(
                 "progress",
                 file=file_name,
