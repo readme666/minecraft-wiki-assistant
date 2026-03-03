@@ -9,7 +9,6 @@ pyserver/__pycache__/
 tauri-app/src-tauri/target/
 .vscode/
 xml/
-tauri-app/src-tauri/icons/
 tauri-app/node_modules/
 # Python
 __pycache__/
