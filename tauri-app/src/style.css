@@ -1312,18 +1312,16 @@ body::after {
 
 /* ===== thinking shimmer (scan / sweep) =====
    - 布局宽度由 bubble 本身 textContent 决定（参与布局）
-   - 真实文字用 color: transparent 隐藏（避免“重影”）
-   - ::before 画底色文字（永远可见）
-   - ::after 画扫光高亮（clip 到文字形状）
+   - 真实文字始终可见，作为低兼容环境的保底显示层
+   - ::after 仅负责扫光高亮，失效时也不影响可读性
 */
 .bubble.thinking {
   position: relative;
-  color: transparent; /* 保留布局，但不显示 DOM 里的真实文字 */
+  color: rgba(241, 240, 240, 0.78);
   overflow: hidden;   /* 只裁剪扫光层，不影响宽度 */
 }
 
-/* 公共：复制文字内容 & 对齐（不要在这里做 clip / 透明化底字） */
-.bubble.thinking::before,
+/* 复制文字内容并对齐，作为可选增强层 */
 .bubble.thinking::after {
   content: attr(data-thinking-text);
   position: absolute;
@@ -1334,15 +1332,9 @@ body::after {
   pointer-events: none;
 }
 
-/* 底色文字：一直可见，提高可读性 */
-.bubble.thinking::before {
-  color: rgba(241, 240, 240, 0.7);
-  z-index: 1;
-}
-
 /* 扫光高亮：只显示在“文字形状”上 */
 .bubble.thinking::after {
-  z-index: 2;
+  z-index: 1;
 
   /* 光束：窄 + 柔和（不是整段亮字） */
   background: linear-gradient(
@@ -1375,7 +1367,7 @@ body::after {
 .bubble.thinking .dots {
   color: var(--muted);
   position: relative;
-  z-index: 3;
+  z-index: 2;
   display: inline-flex;
   gap: 2px;
   margin-left: 4px;
