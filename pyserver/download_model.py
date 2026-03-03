@@ -2,10 +2,9 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
-from huggingface_hub import HfApi, hf_hub_download
-from tqdm.auto import tqdm
+import requests
+from huggingface_hub import HfApi, hf_hub_url
 
 MODEL_REPO_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 MODEL_DIR_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -29,6 +28,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT_DIR / "pyserver" / "models"
 MODEL_DIR = MODELS_DIR / MODEL_DIR_NAME
 HF_CACHE_DIR = ROOT_DIR / ".hf_cache"
+CHUNK_SIZE = 256 * 1024
 
 os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR / "transformers"))
@@ -47,34 +47,6 @@ def format_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-class AggregateProgressTqdm(tqdm):
-    total_bytes: int = 0
-    current_file: str = ""
-    current_file_base: int = 0
-    current_file_emitted: int = 0
-
-    @classmethod
-    def configure(cls, file_name: str, total_bytes: int, completed_bytes: int) -> None:
-        cls.current_file = file_name
-        cls.total_bytes = total_bytes
-        cls.current_file_base = completed_bytes
-        cls.current_file_emitted = completed_bytes
-
-    def update(self, n: int = 1) -> Optional[bool]:
-        result = super().update(n)
-        downloaded = self.current_file_base + int(self.n)
-        if downloaded < self.current_file_emitted:
-            downloaded = self.current_file_emitted
-        self.current_file_emitted = downloaded
-        emit(
-            "progress",
-            file=self.current_file,
-            downloaded_bytes=downloaded,
-            total_bytes=self.total_bytes,
-        )
-        return result
-
-
 def load_file_sizes() -> dict[str, int]:
     info = HfApi().model_info(MODEL_REPO_ID, files_metadata=True)
     sizes: dict[str, int] = {}
@@ -84,6 +56,35 @@ def load_file_sizes() -> dict[str, int]:
             continue
         sizes[name] = int(getattr(sibling, "size", 0) or 0)
     return sizes
+
+
+def download_file(
+    session: requests.Session,
+    file_name: str,
+    target_path: Path,
+    completed_bytes: int,
+    total_bytes: int,
+) -> None:
+    temp_path = target_path.with_suffix(target_path.suffix + ".part")
+    url = hf_hub_url(MODEL_REPO_ID, file_name)
+
+    with session.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        downloaded = completed_bytes
+        with temp_path.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                emit(
+                    "progress",
+                    file=file_name,
+                    downloaded_bytes=downloaded,
+                    total_bytes=total_bytes,
+                )
+
+    temp_path.replace(target_path)
 
 
 def main() -> int:
@@ -108,6 +109,9 @@ def main() -> int:
         file_count=len(MODEL_FILES),
     )
 
+    session = requests.Session()
+    session.headers.update({"User-Agent": "MineRAG/1.0"})
+
     for file_name in MODEL_FILES:
         file_size = file_size_map.get(file_name, 0)
         target_path = MODEL_DIR / file_name
@@ -124,17 +128,12 @@ def main() -> int:
             continue
 
         emit("status", message=f"正在下载 {file_name} ...")
-        AggregateProgressTqdm.configure(
+        download_file(
+            session=session,
             file_name=file_name,
-            total_bytes=total_bytes,
+            target_path=target_path,
             completed_bytes=completed_bytes,
-        )
-        hf_hub_download(
-            repo_id=MODEL_REPO_ID,
-            filename=file_name,
-            local_dir=str(MODEL_DIR),
-            force_download=False,
-            tqdm_class=AggregateProgressTqdm,
+            total_bytes=total_bytes,
         )
         completed_bytes += file_size
         emit(
