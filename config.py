@@ -16,6 +16,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "input_miss_per_million": 2.0,
     "output_per_million": 3.0,
     "font_size": 14,
+    "material_mode": "liquid",
     "debug_mode": False,
     "log_level": "info",
 }

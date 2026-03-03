@@ -31,6 +31,13 @@
           ⚠ 尚未设置 API Key，
           <span id="apiKeyNoticeLink" class="api-key-link">点击这里前往设置</span>
         </div>
+        <div id="gpuNotice" class="gpu-notice hidden">
+          <span id="gpuNoticeText">检测到当前设备可能未使用独立显卡，液态玻璃材质可能影响流畅度。</span>
+          <div class="notice-actions">
+            <button id="gpuNoticeSwitchBtn" class="btn small">切换为普通材质</button>
+            <button id="gpuNoticeDismissBtn" class="btn ghost small">暂不切换</button>
+          </div>
+        </div>
         <section class="chat" id="chatList"></section>
         <section id="aboutPage" class="about-page panel-hidden" aria-labelledby="aboutPageTitle">
           <article class="about-card">
@@ -118,6 +125,32 @@
 
           <label>字体大小</label>
           <input type="number" step="1" id="cfgFontSize" />
+
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <span class="settings-section-title">材质模式</span>
+            </div>
+            <label class="settings-toggle">
+              <span>使用普通材质</span>
+              <input type="checkbox" id="cfgBasicMaterial" />
+            </label>
+            <div class="form-help">关闭后使用液态玻璃材质，开启后使用性能更轻的普通材质。</div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <span class="settings-section-title">显卡检测</span>
+              <button type="button" id="gpuDetectRefreshBtn" class="btn ghost small">重新检测</button>
+            </div>
+            <div id="gpuDetectCard" class="gpu-detect-card">
+              <div class="gpu-detect-topline">
+                <span id="gpuDetectBadge" class="gpu-detect-badge">检测中</span>
+                <span id="gpuDetectReason" class="gpu-detect-reason">正在读取显卡信息…</span>
+              </div>
+              <div id="gpuDetectAdapters" class="gpu-detect-adapters">-</div>
+            </div>
+          </div>
+
           <label>调试模式</label>
           <input type="checkbox" id="cfgDebugMode" />
 

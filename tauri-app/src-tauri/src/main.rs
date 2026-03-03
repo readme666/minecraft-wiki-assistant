@@ -12,6 +12,8 @@ use tauri::{Manager, RunEvent, State, WindowEvent};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+use serde::Serialize;
+
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -30,6 +32,15 @@ impl Drop for BackendGuard {
 
 struct BackendState(Mutex<BackendGuard>);
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphicsCapability {
+    checked: bool,
+    has_dedicated_gpu: Option<bool>,
+    adapters: Vec<String>,
+    reason: String,
+}
+
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle, state: State<BackendState>) {
     kill_python_backend(&state);
@@ -39,6 +50,205 @@ fn restart_app(app: tauri::AppHandle, state: State<BackendState>) {
 #[tauri::command]
 fn get_backend_port(state: State<BackendState>) -> Option<u16> {
     state.0.lock().unwrap().port
+}
+
+#[tauri::command]
+fn detect_graphics_capability() -> GraphicsCapability {
+    detect_graphics_capability_impl()
+}
+
+#[cfg(target_os = "windows")]
+fn detect_graphics_capability_impl() -> GraphicsCapability {
+    let script = r#"
+      $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+      Get-CimInstance Win32_VideoController |
+        ForEach-Object { $_.Name } |
+        ConvertTo-Json -Compress
+    "#;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(err) => {
+            return GraphicsCapability {
+                checked: false,
+                has_dedicated_gpu: None,
+                adapters: Vec::new(),
+                reason: format!("failed to query video controllers: {}", err),
+            };
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return GraphicsCapability {
+            checked: false,
+            has_dedicated_gpu: None,
+            adapters: Vec::new(),
+            reason: if stderr.is_empty() {
+                "powershell query failed".to_string()
+            } else {
+                stderr
+            },
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let adapters = parse_graphics_adapter_names(&stdout);
+    if adapters.is_empty() {
+        return GraphicsCapability {
+            checked: true,
+            has_dedicated_gpu: None,
+            adapters,
+            reason: "no video adapters reported".to_string(),
+        };
+    }
+
+    let hardware_adapters: Vec<String> = adapters
+        .iter()
+        .filter(|name| !is_virtual_or_software_adapter(name))
+        .cloned()
+        .collect();
+
+    if hardware_adapters.iter().any(|name| is_dedicated_gpu_name(name)) {
+        return GraphicsCapability {
+            checked: true,
+            has_dedicated_gpu: Some(true),
+            adapters,
+            reason: "dedicated GPU detected".to_string(),
+        };
+    }
+
+    if !hardware_adapters.is_empty()
+        && hardware_adapters
+            .iter()
+            .all(|name| is_integrated_gpu_name(name))
+    {
+        return GraphicsCapability {
+            checked: true,
+            has_dedicated_gpu: Some(false),
+            adapters,
+            reason: "only integrated GPU detected".to_string(),
+        };
+    }
+
+    GraphicsCapability {
+        checked: true,
+        has_dedicated_gpu: None,
+        adapters,
+        reason: "unable to confidently classify GPU type".to_string(),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_graphics_capability_impl() -> GraphicsCapability {
+    GraphicsCapability {
+        checked: false,
+        has_dedicated_gpu: None,
+        adapters: Vec::new(),
+        reason: "GPU detection is only implemented on Windows".to_string(),
+    }
+}
+
+fn parse_graphics_adapter_names(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::String(name)) => vec![name],
+        Ok(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+            .filter(|name| !name.is_empty())
+            .collect(),
+        _ => raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    }
+}
+
+fn is_virtual_or_software_adapter(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [
+        "microsoft basic display",
+        "remote display",
+        "vmware",
+        "virtualbox",
+        "parallels",
+        "hyper-v",
+        "citrix",
+    ]
+    .iter()
+    .any(|keyword| n.contains(keyword))
+}
+
+fn is_dedicated_gpu_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+
+    if n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("quadro")
+        || n.contains("rtx ")
+        || n.contains("gtx ")
+        || n.contains("tesla")
+        || n.contains("titan")
+        || n.contains("intel arc")
+    {
+        return true;
+    }
+
+    if n.contains("radeon") {
+        return n.contains(" rx ")
+            || n.ends_with(" rx")
+            || n.contains("pro")
+            || n.contains("wx")
+            || n.contains("firepro")
+            || n.contains("vii");
+    }
+
+    false
+}
+
+fn is_integrated_gpu_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+
+    if n.contains("intel")
+        && (n.contains("uhd")
+            || n.contains("iris")
+            || n.contains("hd graphics")
+            || n.contains("xe graphics"))
+        && !n.contains("arc")
+    {
+        return true;
+    }
+
+    if n.contains("radeon(tm) graphics")
+        || n.contains("radeon graphics")
+        || n.contains("vega")
+        || n.contains("680m")
+        || n.contains("760m")
+        || n.contains("780m")
+        || n.contains("880m")
+        || n.contains("890m")
+    {
+        return true;
+    }
+
+    false
 }
 
 fn read_debug_mode(data_dir: &PathBuf) -> bool {
@@ -239,7 +449,11 @@ fn main() {
             child: None,
             port: None,
         })))
-        .invoke_handler(tauri::generate_handler![restart_app, get_backend_port])
+        .invoke_handler(tauri::generate_handler![
+            restart_app,
+            get_backend_port,
+            detect_graphics_capability
+        ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
 

@@ -34,6 +34,10 @@ const LS_ACTIVE_SESSION = "mw_assistant_active_session_v1";
 
 const apiKeyNotice = document.getElementById("apiKeyNotice");
 const apiKeyNoticeLink = document.getElementById("apiKeyNoticeLink");
+const gpuNotice = document.getElementById("gpuNotice");
+const gpuNoticeText = document.getElementById("gpuNoticeText");
+const gpuNoticeSwitchBtn = document.getElementById("gpuNoticeSwitchBtn");
+const gpuNoticeDismissBtn = document.getElementById("gpuNoticeDismissBtn");
 const aboutPage = document.getElementById("aboutPage");
 
 const cfgApiKey = document.getElementById("cfgApiKey");
@@ -45,7 +49,14 @@ const cfgInputHit = document.getElementById("cfgInputHit");
 const cfgInputMiss = document.getElementById("cfgInputMiss");
 const cfgOutput = document.getElementById("cfgOutput");
 const cfgFontSize = document.getElementById("cfgFontSize");
+const cfgBasicMaterial = document.getElementById("cfgBasicMaterial");
+const gpuDetectRefreshBtn = document.getElementById("gpuDetectRefreshBtn");
+const gpuDetectBadge = document.getElementById("gpuDetectBadge");
+const gpuDetectReason = document.getElementById("gpuDetectReason");
+const gpuDetectAdapters = document.getElementById("gpuDetectAdapters");
 const MODEL_OPTIONS = ["deepseek-chat", "deepseek-reasoner"];
+const MATERIAL_MODE_LIQUID = "liquid";
+const MATERIAL_MODE_BASIC = "basic";
 const FALLBACK_EMPTY_STATE_WIKI_TITLES = [
   "红石电路",
   "附魔",
@@ -76,6 +87,8 @@ let isViewTransitioning = false;
 let emptyStateWikiLinks = [];
 let wikiTitlePool = [];
 let apiBase = null;
+let currentMaterialMode = MATERIAL_MODE_LIQUID;
+let currentGraphicsCapability = null;
 const SETTINGS_MODAL_ANIMATION_MS = 420;
 const SETTINGS_MODAL_CONTENT_FADE_MS = 260;
 
@@ -664,6 +677,146 @@ function closeDonateModal() {
   donateModalCloseTimer = window.setTimeout(finishClosingDonateModal, 180);
 }
 
+function normalizeMaterialMode(mode) {
+  return mode === MATERIAL_MODE_BASIC ? MATERIAL_MODE_BASIC : MATERIAL_MODE_LIQUID;
+}
+
+function applyMaterialMode(mode) {
+  currentMaterialMode = normalizeMaterialMode(mode);
+  document.body.classList.toggle("material-basic", currentMaterialMode === MATERIAL_MODE_BASIC);
+  if (cfgBasicMaterial) {
+    cfgBasicMaterial.checked = currentMaterialMode === MATERIAL_MODE_BASIC;
+  }
+  if (currentMaterialMode === MATERIAL_MODE_BASIC) {
+    setGpuNoticeVisible(false);
+  }
+}
+
+function setGpuNoticeVisible(visible, message = "") {
+  if (gpuNoticeText && message) {
+    gpuNoticeText.textContent = message;
+  }
+  gpuNotice?.classList.toggle("hidden", !visible);
+}
+
+function setGpuDetectionUiPending() {
+  gpuDetectBadge.textContent = "检测中";
+  gpuDetectBadge.className = "gpu-detect-badge pending";
+  gpuDetectReason.textContent = "正在读取显卡信息…";
+  gpuDetectAdapters.textContent = "-";
+}
+
+function renderGraphicsCapability(graphics) {
+  currentGraphicsCapability = graphics || null;
+
+  if (!graphics) {
+    gpuDetectBadge.textContent = "未知";
+    gpuDetectBadge.className = "gpu-detect-badge neutral";
+    gpuDetectReason.textContent = "尚未检测显卡信息。";
+    gpuDetectAdapters.textContent = "-";
+    return;
+  }
+
+  const adapters = Array.isArray(graphics.adapters) && graphics.adapters.length > 0
+    ? graphics.adapters.join(" / ")
+    : "未读取到显卡名称";
+  gpuDetectAdapters.textContent = adapters;
+
+  if (!graphics.checked) {
+    gpuDetectBadge.textContent = "未检测";
+    gpuDetectBadge.className = "gpu-detect-badge neutral";
+    gpuDetectReason.textContent = graphics.reason || "当前平台未启用显卡检测。";
+    return;
+  }
+
+  if (graphics.hasDedicatedGpu === true) {
+    gpuDetectBadge.textContent = "独显";
+    gpuDetectBadge.className = "gpu-detect-badge success";
+    gpuDetectReason.textContent = graphics.reason || "已检测到独立显卡。";
+    return;
+  }
+
+  if (graphics.hasDedicatedGpu === false) {
+    gpuDetectBadge.textContent = "集显";
+    gpuDetectBadge.className = "gpu-detect-badge warn";
+    gpuDetectReason.textContent = graphics.reason || "仅检测到集成显卡。建议使用普通材质。";
+    return;
+  }
+
+  gpuDetectBadge.textContent = "不确定";
+  gpuDetectBadge.className = "gpu-detect-badge neutral";
+  gpuDetectReason.textContent = graphics.reason || "无法明确区分独显或集显。";
+}
+
+async function detectGraphicsCapability(force = false) {
+  if (currentGraphicsCapability && !force) {
+    renderGraphicsCapability(currentGraphicsCapability);
+    return currentGraphicsCapability;
+  }
+
+  setGpuDetectionUiPending();
+  try {
+    const graphics = await invoke("detect_graphics_capability");
+    renderGraphicsCapability(graphics);
+    return graphics;
+  } catch (_) {
+    const graphics = {
+      checked: false,
+      hasDedicatedGpu: null,
+      adapters: [],
+      reason: "显卡检测失败"
+    };
+    renderGraphicsCapability(graphics);
+    return graphics;
+  }
+}
+
+async function persistMaterialMode(mode) {
+  const normalized = normalizeMaterialMode(mode);
+  const base = await getApiBase();
+  await fetchJsonWithRetry(
+    `${base}/api/config`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ material_mode: normalized })
+    },
+    6,
+    500
+  );
+  applyMaterialMode(normalized);
+}
+
+async function maybeAdviseBasicMaterial() {
+  if (currentMaterialMode === MATERIAL_MODE_BASIC) {
+    return;
+  }
+
+  const graphics = await detectGraphicsCapability();
+  if (!graphics?.checked || graphics?.hasDedicatedGpu !== false) {
+    return;
+  }
+
+  const adapterSummary = Array.isArray(graphics.adapters) && graphics.adapters.length > 0
+    ? `当前检测到：${graphics.adapters.join(" / ")}。`
+    : "";
+  setGpuNoticeVisible(
+    true,
+    `检测到当前设备可能未使用独立显卡，液态玻璃材质可能影响流畅度。${adapterSummary}可切换为普通材质。`
+  );
+}
+
+async function loadStartupPreferences() {
+  try {
+    const base = await getApiBase();
+    const cfg = await fetchJsonWithRetry(`${base}/api/config`, {}, 8, 500);
+    document.documentElement.style.setProperty("--font-size", `${cfg.font_size ?? 14}px`);
+    applyMaterialMode(cfg.material_mode);
+  } catch (_) {
+    applyMaterialMode(MATERIAL_MODE_LIQUID);
+  }
+}
+
 function getSettingsSnapshot() {
   return {
     apiKey: cfgApiKey.value.trim(),
@@ -674,6 +827,7 @@ function getSettingsSnapshot() {
     inputMissPerMillion: Number(cfgInputMiss.value),
     outputPerMillion: Number(cfgOutput.value),
     fontSize: Number(cfgFontSize.value),
+    materialMode: cfgBasicMaterial?.checked ? MATERIAL_MODE_BASIC : MATERIAL_MODE_LIQUID,
     debugMode: !!cfgDebugMode.checked
   };
 }
@@ -2044,9 +2198,12 @@ async function openSettings(sourceEl = settingsBtn) {
     cfgInputMiss.value = cfg.input_miss_per_million ?? 2.0;
     cfgOutput.value = cfg.output_per_million ?? 3.0;
     cfgFontSize.value = cfg.font_size ?? 14;
+    cfgBasicMaterial.checked = normalizeMaterialMode(cfg.material_mode) === MATERIAL_MODE_BASIC;
     lastLoadedSettingsSnapshot = getSettingsSnapshot();
+    setGpuDetectionUiPending();
 
     showSettingsModal(sourceEl);
+    detectGraphicsCapability(true);
   } catch (err) {
     setStatus("Error");
   }
@@ -2065,6 +2222,29 @@ deepseekApiKeyLink?.addEventListener("click", async () => {
   try {
     await open("https://platform.deepseek.com/api_keys");
   } catch (_) {}
+});
+gpuNoticeSwitchBtn?.addEventListener("click", async () => {
+  gpuNoticeSwitchBtn.disabled = true;
+  try {
+    await persistMaterialMode(MATERIAL_MODE_BASIC);
+    setGpuNoticeVisible(false);
+    setStatus("已切换为普通材质");
+  } catch (_) {
+    setStatus("Error");
+  } finally {
+    gpuNoticeSwitchBtn.disabled = false;
+  }
+});
+gpuNoticeDismissBtn?.addEventListener("click", () => {
+  setGpuNoticeVisible(false);
+});
+gpuDetectRefreshBtn?.addEventListener("click", async () => {
+  gpuDetectRefreshBtn.disabled = true;
+  try {
+    await detectGraphicsCapability(true);
+  } finally {
+    gpuDetectRefreshBtn.disabled = false;
+  }
 });
 
 settingsCancel.addEventListener("click", () => {
@@ -2107,6 +2287,7 @@ settingsSave.addEventListener("click", async () => {
     input_miss_per_million: Number(cfgInputMiss.value),
     output_per_million: Number(cfgOutput.value),
     font_size: Number(cfgFontSize.value),
+    material_mode: cfgBasicMaterial.checked ? MATERIAL_MODE_BASIC : MATERIAL_MODE_LIQUID,
     debug_mode: !!cfgDebugMode.checked,
   };
   const nextSnapshot = getSettingsSnapshot();
@@ -2126,6 +2307,7 @@ settingsSave.addEventListener("click", async () => {
     );
 
     document.documentElement.style.setProperty("--font-size", `${updated.font_size}px`);
+    applyMaterialMode(updated.material_mode);
     lastLoadedSettingsSnapshot = nextSnapshot;
     closeSettingsModal();
     setRestartNoticeVisible(settingsChanged);
@@ -2165,7 +2347,7 @@ async function waitBackendReady() {
     base = await getApiBase();
   } catch (_) {
     setStatus("Backend port unavailable");
-    return;
+    return false;
   }
 
   for (let i = 0; i < 20; i++) {
@@ -2173,7 +2355,7 @@ async function waitBackendReady() {
       const res = await fetch(`${base}/api/health`);
       if (res.ok) {
         setStatus("Ready");
-        return;
+        return true;
       }
     } catch (_) {}
 
@@ -2182,6 +2364,7 @@ async function waitBackendReady() {
   }
 
   setStatus("Backend not responding");
+  return false;
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -2200,6 +2383,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   syncAppTitle();
   autoResizeInput();
 
-  waitBackendReady();
+  const backendReady = await waitBackendReady();
+  if (backendReady) {
+    await loadStartupPreferences();
+    await maybeAdviseBasicMaterial();
+  }
   updateApiKeyNotice();   // ✅ 只显示提示，不弹窗
 });
