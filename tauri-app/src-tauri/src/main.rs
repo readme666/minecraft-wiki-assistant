@@ -15,6 +15,12 @@ use std::os::windows::process::CommandExt;
 use serde::Serialize;
 
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1,
+    DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
+};
+
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 struct BackendGuard {
@@ -39,7 +45,11 @@ struct GraphicsCapability {
     has_dedicated_gpu: Option<bool>,
     adapters: Vec<String>,
     reason: String,
+    dedicated_video_memory_mb: Option<u64>,
+    threshold_mb: u64,
 }
+
+const LIQUID_MATERIAL_MIN_DEDICATED_MB: u64 = 4 * 1024;
 
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle, state: State<BackendState>) {
@@ -59,94 +69,60 @@ fn detect_graphics_capability() -> GraphicsCapability {
 
 #[cfg(target_os = "windows")]
 fn detect_graphics_capability_impl() -> GraphicsCapability {
-    let script = r#"
-      $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-      Get-CimInstance Win32_VideoController |
-        ForEach-Object { $_.Name } |
-        ConvertTo-Json -Compress
-    "#;
-
-    let mut cmd = Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script,
-    ]);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = match cmd.output() {
-        Ok(output) => output,
+    let adapters = match enumerate_dxgi_adapters() {
+        Ok(adapters) => adapters,
         Err(err) => {
             return GraphicsCapability {
                 checked: false,
                 has_dedicated_gpu: None,
                 adapters: Vec::new(),
-                reason: format!("failed to query video controllers: {}", err),
+                reason: format!("DXGI query failed: {err}"),
+                dedicated_video_memory_mb: None,
+                threshold_mb: LIQUID_MATERIAL_MIN_DEDICATED_MB,
             };
         }
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return GraphicsCapability {
-            checked: false,
-            has_dedicated_gpu: None,
-            adapters: Vec::new(),
-            reason: if stderr.is_empty() {
-                "powershell query failed".to_string()
-            } else {
-                stderr
-            },
-        };
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let adapters = parse_graphics_adapter_names(&stdout);
     if adapters.is_empty() {
         return GraphicsCapability {
             checked: true,
             has_dedicated_gpu: None,
-            adapters,
-            reason: "no video adapters reported".to_string(),
+            adapters: Vec::new(),
+            reason: "DXGI reported no physical adapters".to_string(),
+            dedicated_video_memory_mb: None,
+            threshold_mb: LIQUID_MATERIAL_MIN_DEDICATED_MB,
         };
     }
 
-    let hardware_adapters: Vec<String> = adapters
+    let adapter_labels = adapters
         .iter()
-        .filter(|name| !is_virtual_or_software_adapter(name))
-        .cloned()
-        .collect();
+        .map(|adapter| format!("{} ({} MB)", adapter.name, adapter.dedicated_video_memory_mb))
+        .collect::<Vec<_>>();
+    let max_dedicated_video_memory_mb = adapters
+        .iter()
+        .map(|adapter| adapter.dedicated_video_memory_mb)
+        .max();
 
-    if hardware_adapters.iter().any(|name| is_dedicated_gpu_name(name)) {
-        return GraphicsCapability {
-            checked: true,
-            has_dedicated_gpu: Some(true),
-            adapters,
-            reason: "dedicated GPU detected".to_string(),
-        };
-    }
-
-    if !hardware_adapters.is_empty()
-        && hardware_adapters
-            .iter()
-            .all(|name| is_integrated_gpu_name(name))
-    {
-        return GraphicsCapability {
-            checked: true,
-            has_dedicated_gpu: Some(false),
-            adapters,
-            reason: "only integrated GPU detected".to_string(),
-        };
-    }
+    let has_dedicated_gpu = max_dedicated_video_memory_mb
+        .map(|memory_mb| memory_mb > LIQUID_MATERIAL_MIN_DEDICATED_MB);
 
     GraphicsCapability {
         checked: true,
-        has_dedicated_gpu: None,
-        adapters,
-        reason: "unable to confidently classify GPU type".to_string(),
+        has_dedicated_gpu,
+        adapters: adapter_labels,
+        reason: match max_dedicated_video_memory_mb {
+            Some(memory_mb) if memory_mb > LIQUID_MATERIAL_MIN_DEDICATED_MB => format!(
+                "max DedicatedVideoMemory = {memory_mb} MB, above {} MB threshold",
+                LIQUID_MATERIAL_MIN_DEDICATED_MB
+            ),
+            Some(memory_mb) => format!(
+                "max DedicatedVideoMemory = {memory_mb} MB, not above {} MB threshold",
+                LIQUID_MATERIAL_MIN_DEDICATED_MB
+            ),
+            None => "DedicatedVideoMemory unavailable".to_string(),
+        },
+        dedicated_video_memory_mb: max_dedicated_video_memory_mb,
+        threshold_mb: LIQUID_MATERIAL_MIN_DEDICATED_MB,
     }
 }
 
@@ -157,98 +133,66 @@ fn detect_graphics_capability_impl() -> GraphicsCapability {
         has_dedicated_gpu: None,
         adapters: Vec::new(),
         reason: "GPU detection is only implemented on Windows".to_string(),
+        dedicated_video_memory_mb: None,
+        threshold_mb: LIQUID_MATERIAL_MIN_DEDICATED_MB,
     }
 }
 
-fn parse_graphics_adapter_names(raw: &str) -> Vec<String> {
-    if raw.is_empty() {
-        return Vec::new();
-    }
-
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::String(name)) => vec![name],
-        Ok(serde_json::Value::Array(items)) => items
-            .into_iter()
-            .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
-            .filter(|name| !name.is_empty())
-            .collect(),
-        _ => raw
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-    }
+#[cfg(target_os = "windows")]
+struct DxgiAdapterInfo {
+    name: String,
+    dedicated_video_memory_mb: u64,
 }
 
-fn is_virtual_or_software_adapter(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    [
-        "microsoft basic display",
-        "remote display",
-        "vmware",
-        "virtualbox",
-        "parallels",
-        "hyper-v",
-        "citrix",
-    ]
-    .iter()
-    .any(|keyword| n.contains(keyword))
+#[cfg(target_os = "windows")]
+fn enumerate_dxgi_adapters() -> Result<Vec<DxgiAdapterInfo>, String> {
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|err| err.to_string())?;
+    let mut adapters = Vec::new();
+    let mut index = 0;
+
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(err) => return Err(err.to_string()),
+        };
+
+        if let Some(adapter_info) = read_dxgi_adapter(adapter)? {
+            adapters.push(adapter_info);
+        }
+        index += 1;
+    }
+
+    Ok(adapters)
 }
 
-fn is_dedicated_gpu_name(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-
-    if n.contains("nvidia")
-        || n.contains("geforce")
-        || n.contains("quadro")
-        || n.contains("rtx ")
-        || n.contains("gtx ")
-        || n.contains("tesla")
-        || n.contains("titan")
-        || n.contains("intel arc")
-    {
-        return true;
+#[cfg(target_os = "windows")]
+fn read_dxgi_adapter(adapter: IDXGIAdapter1) -> Result<Option<DxgiAdapterInfo>, String> {
+    let desc: DXGI_ADAPTER_DESC1 = unsafe { adapter.GetDesc1() }.map_err(|err| err.to_string())?;
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+        return Ok(None);
     }
 
-    if n.contains("radeon") {
-        return n.contains(" rx ")
-            || n.ends_with(" rx")
-            || n.contains("pro")
-            || n.contains("wx")
-            || n.contains("firepro")
-            || n.contains("vii");
+    let name = utf16_to_string(&desc.Description);
+    if name.is_empty() {
+        return Ok(None);
     }
 
-    false
+    Ok(Some(DxgiAdapterInfo {
+        name,
+        dedicated_video_memory_mb: bytes_to_mb(desc.DedicatedVideoMemory as u64),
+    }))
 }
 
-fn is_integrated_gpu_name(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
+fn bytes_to_mb(bytes: u64) -> u64 {
+    bytes / 1024 / 1024
+}
 
-    if n.contains("intel")
-        && (n.contains("uhd")
-            || n.contains("iris")
-            || n.contains("hd graphics")
-            || n.contains("xe graphics"))
-        && !n.contains("arc")
-    {
-        return true;
-    }
-
-    if n.contains("radeon(tm) graphics")
-        || n.contains("radeon graphics")
-        || n.contains("vega")
-        || n.contains("680m")
-        || n.contains("760m")
-        || n.contains("780m")
-        || n.contains("880m")
-        || n.contains("890m")
-    {
-        return true;
-    }
-
-    false
+#[cfg(target_os = "windows")]
+fn utf16_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end]).trim().to_string()
 }
 
 fn read_debug_mode(data_dir: &PathBuf) -> bool {
@@ -425,9 +369,10 @@ fn stop_backend(child: &mut Child) {
     let pid = child.id().to_string();
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid])
-            .status();
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.status();
     }
     #[cfg(not(target_os = "windows"))]
     {

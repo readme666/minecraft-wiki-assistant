@@ -729,23 +729,34 @@ function renderGraphicsCapability(graphics) {
     return;
   }
 
+  const memoryMb = Number.isFinite(Number(graphics.dedicatedVideoMemoryMb))
+    ? Number(graphics.dedicatedVideoMemoryMb)
+    : null;
+  const thresholdMb = Number.isFinite(Number(graphics.thresholdMb))
+    ? Number(graphics.thresholdMb)
+    : 4096;
+
   if (graphics.hasDedicatedGpu === true) {
-    gpuDetectBadge.textContent = "独显";
+    gpuDetectBadge.textContent = "液态玻璃";
     gpuDetectBadge.className = "gpu-detect-badge success";
-    gpuDetectReason.textContent = graphics.reason || "已检测到独立显卡。";
+    gpuDetectReason.textContent = memoryMb !== null
+      ? `判定依据：DedicatedVideoMemory = ${memoryMb} MB，大于 ${thresholdMb} MB，建议使用液态玻璃材质。`
+      : (graphics.reason || "DedicatedVideoMemory 满足液态玻璃阈值。");
     return;
   }
 
   if (graphics.hasDedicatedGpu === false) {
-    gpuDetectBadge.textContent = "集显";
+    gpuDetectBadge.textContent = "普通材质";
     gpuDetectBadge.className = "gpu-detect-badge warn";
-    gpuDetectReason.textContent = graphics.reason || "仅检测到集成显卡。建议使用普通材质。";
+    gpuDetectReason.textContent = memoryMb !== null
+      ? `判定依据：DedicatedVideoMemory = ${memoryMb} MB，不大于 ${thresholdMb} MB，建议使用普通材质。`
+      : (graphics.reason || "DedicatedVideoMemory 未达到液态玻璃阈值。");
     return;
   }
 
   gpuDetectBadge.textContent = "不确定";
   gpuDetectBadge.className = "gpu-detect-badge neutral";
-  gpuDetectReason.textContent = graphics.reason || "无法明确区分独显或集显。";
+  gpuDetectReason.textContent = graphics.reason || "无法读取 DedicatedVideoMemory。";
 }
 
 async function detectGraphicsCapability(force = false) {
@@ -800,9 +811,12 @@ async function maybeAdviseBasicMaterial() {
   const adapterSummary = Array.isArray(graphics.adapters) && graphics.adapters.length > 0
     ? `当前检测到：${graphics.adapters.join(" / ")}。`
     : "";
+  const memorySummary = Number.isFinite(Number(graphics.dedicatedVideoMemoryMb))
+    ? `最大 DedicatedVideoMemory 为 ${Number(graphics.dedicatedVideoMemoryMb)} MB。`
+    : "";
   setGpuNoticeVisible(
     true,
-    `检测到当前设备可能未使用独立显卡，液态玻璃材质可能影响流畅度。${adapterSummary}可切换为普通材质。`
+    `检测到当前设备显存未超过液态玻璃阈值，建议使用普通材质。${memorySummary}${adapterSummary}`
   );
 }
 
