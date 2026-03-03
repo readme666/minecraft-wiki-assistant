@@ -583,6 +583,11 @@ function attachLiquidPointerTracking(element) {
     }, resetDelay);
   };
   element.addEventListener("pointermove", (event) => {
+    if (currentMaterialMode === MATERIAL_MODE_BASIC) {
+      element.classList.remove("liquid-glow-active");
+      resetPointerGlow();
+      return;
+    }
     clearPendingReset();
     element.classList.add("liquid-glow-active");
     const rect = element.getBoundingClientRect();
@@ -607,6 +612,14 @@ function attachLiquidPointerTracking(element) {
       }, 0);
     });
   }
+}
+
+function resetAllLiquidPointerEffects() {
+  document.querySelectorAll("[data-liquid-pointer-bound='1']").forEach((element) => {
+    element.classList.remove("liquid-glow-active");
+    element.style.setProperty("--pointer-x", "50%");
+    element.style.setProperty("--pointer-y", "50%");
+  });
 }
 
 function showSettingsModal(originEl = settingsBtn) {
@@ -698,6 +711,7 @@ function applyMaterialMode(mode) {
     cfgBasicMaterial.checked = currentMaterialMode === MATERIAL_MODE_BASIC;
   }
   if (currentMaterialMode === MATERIAL_MODE_BASIC) {
+    resetAllLiquidPointerEffects();
     setGpuNoticeVisible(false);
   }
 }
