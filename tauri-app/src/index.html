@@ -126,22 +126,16 @@
           <label>字体大小</label>
           <input type="number" step="1" id="cfgFontSize" />
 
-          <div class="settings-section">
-            <div class="settings-section-header">
-              <span class="settings-section-title">材质模式</span>
-            </div>
-            <label class="settings-toggle">
-              <span>使用普通材质</span>
-              <input type="checkbox" id="cfgBasicMaterial" />
-            </label>
-            <div class="form-help">关闭后使用液态玻璃材质，开启后使用性能更轻的普通材质。</div>
-          </div>
+          <label>材质模式</label>
+          <label class="settings-toggle settings-inline-control">
+            <span>使用普通材质</span>
+            <input type="checkbox" id="cfgBasicMaterial" />
+          </label>
+          <div class="form-help">关闭后使用液态玻璃材质，开启后使用性能更轻的普通材质。</div>
 
-          <div class="settings-section">
-            <div class="settings-section-header">
-              <span class="settings-section-title">显卡检测</span>
-              <button type="button" id="gpuDetectRefreshBtn" class="btn ghost small">重新检测</button>
-            </div>
+          <label class="settings-top-label">显卡检测</label>
+          <div class="settings-detail-row gpu-detect-row">
+            <button type="button" id="gpuDetectRefreshBtn" class="btn ghost small">重新检测</button>
             <div id="gpuDetectCard" class="gpu-detect-card">
               <div class="gpu-detect-topline">
                 <span id="gpuDetectBadge" class="gpu-detect-badge">检测中</span>
@@ -170,6 +164,28 @@
         <img id="donateImage" class="donate-image" src="/donate.jpg" alt="捐赠二维码" />
         <div class="modal-actions">
           <button id="donateCloseBtn" class="btn">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="modelDownloadModal" class="modal hidden model-download-modal">
+      <div class="modal-content model-download-content">
+        <div class="modal-title">下载语义模型</div>
+        <p id="modelDownloadLead" class="model-download-lead">
+          当前缺少本地语义检索模型，下载完成后才可使用问答功能。
+        </p>
+        <div class="model-download-progress-card">
+          <div class="model-download-progress-topline">
+            <span id="modelDownloadPercent" class="model-download-percent">0%</span>
+            <span id="modelDownloadBytes" class="model-download-bytes">0 MB / 0 MB</span>
+          </div>
+          <div class="model-download-progress-track">
+            <div id="modelDownloadBar" class="model-download-progress-bar"></div>
+          </div>
+          <div id="modelDownloadMessage" class="model-download-message">等待下载</div>
+        </div>
+        <div class="modal-actions">
+          <button id="modelDownloadBtn" class="btn">开始下载</button>
         </div>
       </div>
     </div>

@@ -1562,6 +1562,8 @@ body::after {
 
 #settingsModal {
   animation: none;
+  padding: 20px 16px;
+  box-sizing: border-box;
 }
 
 .modal.closing {
@@ -1601,6 +1603,11 @@ body::after {
 
 #settingsModal .modal-content {
   animation: none;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 18px;
 }
 
 .modal.settings-morphing .modal-content {
@@ -1709,9 +1716,65 @@ body::after {
   z-index: 1;
 }
 
+#settingsModal .form {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 8px;
+  margin-right: -8px;
+  align-content: start;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(232, 240, 248, 0.18) transparent;
+}
+
+#settingsModal .form::-webkit-scrollbar {
+  width: 10px;
+}
+
+#settingsModal .form::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#settingsModal .form::-webkit-scrollbar-thumb {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2) 0%, rgba(214, 229, 244, 0.12) 100%);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+#settingsModal .form::-webkit-scrollbar-thumb:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.3) 0%, rgba(214, 229, 244, 0.18) 100%);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+#settingsModal .modal-title,
+#settingsModal .modal-actions {
+  flex-shrink: 0;
+}
+
+#settingsModal #openLogDirBtn {
+  min-height: 40px;
+  padding: 9px 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: start;
+  align-self: center;
+  white-space: nowrap;
+}
+
 .form label {
   color: rgba(229, 229, 229, 0.78);
   align-self: center;
+}
+
+.form label.settings-top-label {
+  align-self: start;
+  padding-top: 8px;
 }
 
 .form-help {
@@ -1840,6 +1903,41 @@ body::after {
   margin-top: 20px;
   position: relative;
   z-index: 1;
+}
+
+#settingsModal .modal-actions {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(190, 210, 235, 0.12);
+}
+
+@media (max-width: 640px) {
+  #settingsModal {
+    padding: 12px;
+  }
+
+  #settingsModal .modal-content {
+    width: min(100%, calc(100vw - 24px));
+    max-height: calc(100vh - 24px);
+    padding: 18px 18px 14px;
+    border-radius: 22px;
+  }
+
+  #settingsModal .form {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding-right: 4px;
+    margin-right: -4px;
+  }
+
+  #settingsModal .form-help,
+  #settingsModal .settings-detail-row {
+    grid-column: 1;
+  }
+
+  #settingsModal .form label {
+    align-self: end;
+  }
 }
 
 /* markdown */
@@ -2178,10 +2276,30 @@ body::after {
   cursor: pointer;
 }
 
+.settings-inline-control {
+  min-height: 40px;
+  align-self: center;
+}
+
+.settings-detail-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
 .gpu-detect-card {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .gpu-detect-topline {
@@ -2301,4 +2419,69 @@ body.material-basic .restart-notice::after {
   opacity: 0 !important;
   background: none !important;
   filter: none !important;
+}
+
+.model-download-modal {
+  z-index: 1200;
+}
+
+.model-download-content {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.model-download-lead {
+  margin: 0 0 18px;
+  color: #d8e5f3;
+  line-height: 1.6;
+}
+
+.model-download-progress-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 16px 18px;
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.03) 100%),
+    linear-gradient(135deg, rgba(25, 37, 51, 0.56) 0%, rgba(15, 24, 34, 0.7) 100%);
+  border: 1px solid rgba(194, 214, 236, 0.12);
+}
+
+.model-download-progress-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-download-percent {
+  font-size: 22px;
+  font-weight: 700;
+  color: #eef6ff;
+}
+
+.model-download-bytes,
+.model-download-message {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.model-download-progress-track {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(164, 190, 218, 0.12);
+}
+
+.model-download-progress-bar {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background:
+    linear-gradient(90deg, #7cc7ff 0%, #8df2d2 52%, #f8ffb1 100%);
+  box-shadow: 0 0 20px rgba(124, 199, 255, 0.34);
+  transition: width 180ms ease-out;
 }

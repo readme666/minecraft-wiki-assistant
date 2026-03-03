@@ -12,7 +12,7 @@ use tauri::{Manager, RunEvent, State, WindowEvent};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::{
@@ -38,6 +38,45 @@ impl Drop for BackendGuard {
 
 struct BackendState(Mutex<BackendGuard>);
 
+struct ModelDownloadState(Mutex<ModelDownloadGuard>);
+
+struct ModelDownloadGuard {
+    state: String,
+    message: String,
+    error: Option<String>,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    active: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatus {
+    ready: bool,
+    path: String,
+    missing_files: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelDownloadSnapshot {
+    state: String,
+    message: String,
+    error: Option<String>,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    progress: f64,
+}
+
+#[derive(Deserialize)]
+struct ModelDownloadEvent {
+    event: String,
+    message: Option<String>,
+    error: Option<String>,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphicsCapability {
@@ -50,6 +89,16 @@ struct GraphicsCapability {
 }
 
 const LIQUID_MATERIAL_MIN_DEDICATED_MB: u64 = 4 * 1024;
+const MODEL_DIR_NAME: &str = "paraphrase-multilingual-MiniLM-L12-v2";
+const REQUIRED_MODEL_FILES: &[&str] = &[
+    "1_Pooling/config.json",
+    "config.json",
+    "config_sentence_transformers.json",
+    "model.safetensors",
+    "modules.json",
+    "sentence_bert_config.json",
+    "tokenizer.json",
+];
 
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle, state: State<BackendState>) {
@@ -65,6 +114,259 @@ fn get_backend_port(state: State<BackendState>) -> Option<u16> {
 #[tauri::command]
 fn detect_graphics_capability() -> GraphicsCapability {
     detect_graphics_capability_impl()
+}
+
+#[tauri::command]
+fn get_model_status() -> Result<ModelStatus, String> {
+    let model_dir = resolve_model_dir().ok_or_else(|| "pyserver/server.py not found".to_string())?;
+    let missing_files = missing_model_files(&model_dir);
+    Ok(ModelStatus {
+        ready: missing_files.is_empty(),
+        path: model_dir.display().to_string(),
+        missing_files,
+    })
+}
+
+#[tauri::command]
+fn get_model_download_status(state: State<ModelDownloadState>) -> ModelDownloadSnapshot {
+    let guard = state.0.lock().unwrap();
+    let progress = if guard.total_bytes > 0 {
+        (guard.downloaded_bytes as f64 / guard.total_bytes as f64).clamp(0.0, 1.0)
+    } else if guard.state == "completed" {
+        1.0
+    } else {
+        0.0
+    };
+
+    ModelDownloadSnapshot {
+        state: guard.state.clone(),
+        message: guard.message.clone(),
+        error: guard.error.clone(),
+        downloaded_bytes: guard.downloaded_bytes,
+        total_bytes: guard.total_bytes,
+        progress,
+    }
+}
+
+#[tauri::command]
+fn ensure_backend_started(app: tauri::AppHandle, state: State<BackendState>) -> Result<Option<u16>, String> {
+    {
+        let guard = state.0.lock().unwrap();
+        if let Some(port) = guard.port {
+            return Ok(Some(port));
+        }
+    }
+
+    let model_dir = resolve_model_dir().ok_or_else(|| "pyserver/server.py not found".to_string())?;
+    let missing_files = missing_model_files(&model_dir);
+    if !missing_files.is_empty() {
+        return Err(format!("model missing: {}", missing_files.join(", ")));
+    }
+
+    let data_dir = app.path().app_data_dir().ok();
+    let debug_mode = data_dir.as_ref().map(read_debug_mode).unwrap_or(false);
+    let Some((child, port)) = start_backend(data_dir, debug_mode) else {
+        return Err("failed to start backend".to_string());
+    };
+
+    let mut guard = state.0.lock().unwrap();
+    if guard.port.is_none() {
+        guard.child = Some(child);
+        guard.port = Some(port);
+    }
+    Ok(guard.port)
+}
+
+#[tauri::command]
+fn start_model_download(
+    app: tauri::AppHandle,
+    download_state: State<ModelDownloadState>,
+) -> Result<(), String> {
+    let model_dir = resolve_model_dir().ok_or_else(|| "pyserver/server.py not found".to_string())?;
+    if missing_model_files(&model_dir).is_empty() {
+        {
+            let mut guard = download_state.0.lock().unwrap();
+            guard.state = "completed".to_string();
+            guard.message = "模型已就绪".to_string();
+            guard.error = None;
+            guard.active = false;
+        }
+        return Ok(());
+    }
+
+    {
+        let mut guard = download_state.0.lock().unwrap();
+        if guard.active {
+            return Ok(());
+        }
+        guard.state = "starting".to_string();
+        guard.message = "正在启动模型下载...".to_string();
+        guard.error = None;
+        guard.downloaded_bytes = 0;
+        guard.total_bytes = 0;
+        guard.active = true;
+    }
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|v| v.to_path_buf()))
+        .ok_or_else(|| "failed to resolve executable directory".to_string())?;
+    let server = resolve_backend_server(&exe_dir).ok_or_else(|| "pyserver/server.py not found".to_string())?;
+    let server_root = server
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "failed to resolve server root".to_string())?;
+    let downloader = server
+        .parent()
+        .map(|p| p.join("download_model.py"))
+        .ok_or_else(|| "failed to resolve download_model.py".to_string())?;
+    if !downloader.exists() {
+        return Err(format!("download script not found: {}", downloader.display()));
+    }
+
+    let data_dir = app.path().app_data_dir().ok();
+    let debug_mode = data_dir.as_ref().map(read_debug_mode).unwrap_or(false);
+    let python_bin = backend_download_python_candidates(&exe_dir)
+        .into_iter()
+        .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
+        .ok_or_else(|| "no usable python runtime found".to_string())?;
+
+    let app_handle = app.clone();
+
+    std::thread::spawn(move || {
+        let mut cmd = Command::new(&python_bin);
+        cmd.arg("-u")
+            .arg(&downloader)
+            .current_dir(&server_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        if let Some(d) = data_dir.as_ref() {
+            cmd.env("MWA_DATA_DIR", d);
+        }
+
+        #[cfg(target_os = "windows")]
+        if !debug_mode {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let state_handle = app_handle.state::<ModelDownloadState>();
+                let mut guard = state_handle.0.lock().unwrap();
+                guard.state = "error".to_string();
+                guard.message = "启动下载失败".to_string();
+                guard.error = Some(err.to_string());
+                guard.active = false;
+                return;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let state_handle = app_handle.state::<ModelDownloadState>();
+                let mut guard = state_handle.0.lock().unwrap();
+                guard.state = "error".to_string();
+                guard.message = "无法读取下载进度".to_string();
+                guard.error = Some("missing stdout".to_string());
+                guard.active = false;
+                let _ = child.kill();
+                return;
+            }
+        };
+
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if let Some(payload) = line.strip_prefix("MODEL_DOWNLOAD ") {
+                if let Ok(event) = serde_json::from_str::<ModelDownloadEvent>(payload) {
+                    let state_handle = app_handle.state::<ModelDownloadState>();
+                    let mut guard = state_handle.0.lock().unwrap();
+                    match event.event.as_str() {
+                        "meta" => {
+                            guard.state = "downloading".to_string();
+                            guard.total_bytes = event.total_bytes.unwrap_or(guard.total_bytes);
+                            guard.downloaded_bytes =
+                                event.downloaded_bytes.unwrap_or(guard.downloaded_bytes);
+                            guard.message = format!("正在下载模型... {}/{}", guard.downloaded_bytes, guard.total_bytes);
+                            guard.error = None;
+                        }
+                        "status" => {
+                            guard.state = "downloading".to_string();
+                            if let Some(message) = event.message {
+                                guard.message = message;
+                            }
+                        }
+                        "progress" => {
+                            guard.state = "downloading".to_string();
+                            guard.total_bytes = event.total_bytes.unwrap_or(guard.total_bytes);
+                            guard.downloaded_bytes =
+                                event.downloaded_bytes.unwrap_or(guard.downloaded_bytes);
+                        }
+                        "done" => {
+                            if let Some(total_bytes) = event.total_bytes {
+                                guard.total_bytes = total_bytes;
+                                guard.downloaded_bytes = total_bytes;
+                            }
+                            guard.state = "completed".to_string();
+                            guard.message = "模型下载完成".to_string();
+                            guard.error = None;
+                            guard.active = false;
+                        }
+                        "error" => {
+                            guard.state = "error".to_string();
+                            guard.message = "模型下载失败".to_string();
+                            guard.error = event.error;
+                            guard.active = false;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if !line.trim().is_empty() {
+                eprintln!("[model download] {}", line);
+            }
+        }
+
+        match child.wait() {
+            Ok(status) if status.success() => {
+                let state_handle = app_handle.state::<ModelDownloadState>();
+                let mut guard = state_handle.0.lock().unwrap();
+                if guard.state != "completed" {
+                    guard.state = "completed".to_string();
+                    guard.message = "模型下载完成".to_string();
+                    guard.error = None;
+                }
+                guard.active = false;
+            }
+            Ok(status) => {
+                let state_handle = app_handle.state::<ModelDownloadState>();
+                let mut guard = state_handle.0.lock().unwrap();
+                if guard.state != "error" {
+                    guard.state = "error".to_string();
+                    guard.message = "模型下载失败".to_string();
+                    guard.error = Some(format!("process exited with {}", status));
+                }
+                guard.active = false;
+            }
+            Err(err) => {
+                let state_handle = app_handle.state::<ModelDownloadState>();
+                let mut guard = state_handle.0.lock().unwrap();
+                guard.state = "error".to_string();
+                guard.message = "模型下载失败".to_string();
+                guard.error = Some(err.to_string());
+                guard.active = false;
+            }
+        }
+    });
+
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -237,6 +539,16 @@ fn backend_python_candidates(exe_dir: &PathBuf, debug_mode: bool) -> Vec<PathBuf
     candidates
 }
 
+fn backend_download_python_candidates(exe_dir: &PathBuf) -> Vec<PathBuf> {
+    let bundled_python = exe_dir.join("python").join("python.exe");
+    let mut candidates = Vec::new();
+    if bundled_python.exists() {
+        candidates.push(bundled_python);
+    }
+    candidates.push(PathBuf::from("python"));
+    candidates
+}
+
 fn backend_server_candidates(exe_dir: &PathBuf) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -261,6 +573,27 @@ fn resolve_backend_server(exe_dir: &PathBuf) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn resolve_model_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let server = resolve_backend_server(&exe_dir)?;
+    let pyserver_dir = server.parent()?;
+    Some(pyserver_dir.join("models").join(MODEL_DIR_NAME))
+}
+
+fn missing_model_files(model_dir: &PathBuf) -> Vec<String> {
+    REQUIRED_MODEL_FILES
+        .iter()
+        .filter_map(|relative| {
+            let path = model_dir.join(relative);
+            if path.exists() {
+                None
+            } else {
+                Some((*relative).to_string())
+            }
+        })
+        .collect()
 }
 
 fn parse_backend_port_line(line: &str) -> Option<u16> {
@@ -394,10 +727,22 @@ fn main() {
             child: None,
             port: None,
         })))
+        .manage(ModelDownloadState(Mutex::new(ModelDownloadGuard {
+            state: "idle".to_string(),
+            message: "等待下载".to_string(),
+            error: None,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            active: false,
+        })))
         .invoke_handler(tauri::generate_handler![
             restart_app,
             get_backend_port,
-            detect_graphics_capability
+            detect_graphics_capability,
+            get_model_status,
+            get_model_download_status,
+            start_model_download,
+            ensure_backend_started
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
@@ -408,9 +753,17 @@ fn main() {
                 .map(read_debug_mode)
                 .unwrap_or(false);
 
-            let backend = start_backend(data_dir, debug_mode);
+            let model_ready = resolve_model_dir()
+                .map(|dir| missing_model_files(&dir).is_empty())
+                .unwrap_or(false);
+            let backend = if model_ready {
+                start_backend(data_dir, debug_mode)
+            } else {
+                eprintln!("[backend] model missing, backend startup deferred");
+                None
+            };
 
-            if backend.is_none() {
+            if model_ready && backend.is_none() {
                 eprintln!("[backend] failed to start backend");
             }
 

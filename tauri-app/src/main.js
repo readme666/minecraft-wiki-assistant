@@ -23,6 +23,14 @@ const settingsModalContent = settingsModal?.querySelector(".modal-content");
 const settingsModalTitle = settingsModal?.querySelector(".modal-title");
 const donateModal = document.getElementById("donateModal");
 const donateModalContent = donateModal?.querySelector(".modal-content");
+const modelDownloadModal = document.getElementById("modelDownloadModal");
+const modelDownloadContent = modelDownloadModal?.querySelector(".modal-content");
+const modelDownloadLead = document.getElementById("modelDownloadLead");
+const modelDownloadPercent = document.getElementById("modelDownloadPercent");
+const modelDownloadBytes = document.getElementById("modelDownloadBytes");
+const modelDownloadBar = document.getElementById("modelDownloadBar");
+const modelDownloadMessage = document.getElementById("modelDownloadMessage");
+const modelDownloadBtn = document.getElementById("modelDownloadBtn");
 const donatePreviewBtn = document.getElementById("donatePreviewBtn");
 const donateCloseBtn = document.getElementById("donateCloseBtn");
 const settingsSave = document.getElementById("settingsSave");
@@ -89,6 +97,8 @@ let wikiTitlePool = [];
 let apiBase = null;
 let currentMaterialMode = MATERIAL_MODE_LIQUID;
 let currentGraphicsCapability = null;
+let modelGateActive = false;
+let modelDownloadPollTimer = null;
 const SETTINGS_MODAL_ANIMATION_MS = 420;
 const SETTINGS_MODAL_CONTENT_FADE_MS = 260;
 
@@ -1339,6 +1349,134 @@ function setStatus(text) {
     statusLabel.classList.remove("running");
   }
 }
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(Number(bytes)) || Number(bytes) <= 0) {
+    return "0 MB";
+  }
+  return `${(Number(bytes) / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function setModelDownloadModalVisible(visible) {
+  if (!modelDownloadModal) return;
+  modelDownloadModal.classList.toggle("hidden", !visible);
+}
+
+function renderModelDownloadStatus(status, { lead } = {}) {
+  const progress = Math.max(0, Math.min(1, Number(status?.progress ?? 0)));
+  const downloadedBytes = Number(status?.downloadedBytes ?? 0);
+  const totalBytes = Number(status?.totalBytes ?? 0);
+  const percent = totalBytes > 0 ? Math.round(progress * 100) : status?.state === "completed" ? 100 : 0;
+
+  if (lead && modelDownloadLead) {
+    modelDownloadLead.textContent = lead;
+  }
+  if (modelDownloadPercent) {
+    modelDownloadPercent.textContent = `${percent}%`;
+  }
+  if (modelDownloadBytes) {
+    modelDownloadBytes.textContent = `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}`;
+  }
+  if (modelDownloadBar) {
+    modelDownloadBar.style.width = `${percent}%`;
+  }
+  if (modelDownloadMessage) {
+    modelDownloadMessage.textContent = status?.error || status?.message || "等待下载";
+  }
+}
+
+function stopModelDownloadPolling() {
+  if (!modelDownloadPollTimer) return;
+  window.clearInterval(modelDownloadPollTimer);
+  modelDownloadPollTimer = null;
+}
+
+async function pollModelDownloadStatus() {
+  try {
+    const status = await invoke("get_model_download_status");
+    renderModelDownloadStatus(status);
+
+    if (status.state === "completed") {
+      stopModelDownloadPolling();
+      modelDownloadBtn.disabled = true;
+      modelDownloadBtn.textContent = "模型已就绪";
+      modelGateActive = false;
+      setStatus("模型下载完成，正在启动后端...");
+      await invoke("ensure_backend_started");
+      const backendReady = await waitBackendReady();
+      if (backendReady) {
+        setModelDownloadModalVisible(false);
+        await loadStartupPreferences();
+        await maybeAdviseBasicMaterial();
+        updateApiKeyNotice();
+      }
+      return;
+    }
+
+    if (status.state === "error") {
+      stopModelDownloadPolling();
+      modelDownloadBtn.disabled = false;
+      modelDownloadBtn.textContent = "重新下载";
+      setStatus("模型下载失败");
+    }
+  } catch (_) {
+    stopModelDownloadPolling();
+    modelDownloadBtn.disabled = false;
+    modelDownloadBtn.textContent = "重新下载";
+    setStatus("模型下载状态读取失败");
+  }
+}
+
+function startModelDownloadPolling() {
+  if (modelDownloadPollTimer) return;
+  modelDownloadPollTimer = window.setInterval(() => {
+    pollModelDownloadStatus();
+  }, 400);
+}
+
+async function ensureModelReady() {
+  try {
+    const model = await invoke("get_model_status");
+    if (model.ready) {
+      modelGateActive = false;
+      setModelDownloadModalVisible(false);
+      return true;
+    }
+
+    modelGateActive = true;
+    setUiLocked(true, "缺少语义模型");
+    setModelDownloadModalVisible(true);
+    const missingSummary = Array.isArray(model.missingFiles) && model.missingFiles.length
+      ? `缺少 ${model.missingFiles.length} 个模型文件，请先下载。`
+      : "当前缺少本地语义检索模型，下载完成后才可使用问答功能。";
+    renderModelDownloadStatus(
+      {
+        state: "idle",
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        message: "等待下载"
+      },
+      { lead: missingSummary }
+    );
+    modelDownloadBtn.disabled = false;
+    modelDownloadBtn.textContent = "开始下载";
+    setStatus("请先下载语义模型");
+    return false;
+  } catch (_) {
+    modelGateActive = true;
+    setUiLocked(true, "模型检测失败");
+    setModelDownloadModalVisible(true);
+    renderModelDownloadStatus(
+      { state: "error", progress: 0, downloadedBytes: 0, totalBytes: 0, error: "模型检测失败" },
+      { lead: "无法检测模型目录，请检查程序安装是否完整。" }
+    );
+    modelDownloadBtn.disabled = true;
+    modelDownloadBtn.textContent = "不可用";
+    return false;
+  }
+}
+
 function updateApiKeyNotice() {
   const hasKey = !!getApiKey();
   if (hasKey) {
@@ -1856,6 +1994,11 @@ function ensureApiKeyOrPrompt() {
   return true;
 }
 async function sendMessage() {
+  if (modelGateActive) {
+    setModelDownloadModalVisible(true);
+    setStatus("请先下载语义模型");
+    return;
+  }
   if (!getApiKey()) {
     setStatus("请先在设置中填写 API Key");
     showSettingsModal();
@@ -2232,6 +2375,35 @@ donatePreviewBtn?.addEventListener("click", () => {
 donateCloseBtn?.addEventListener("click", () => {
   closeDonateModal();
 });
+modelDownloadBtn?.addEventListener("click", async () => {
+  modelDownloadBtn.disabled = true;
+  modelDownloadBtn.textContent = "下载中...";
+  renderModelDownloadStatus({
+    state: "starting",
+    progress: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    message: "正在启动模型下载..."
+  });
+  setStatus("正在下载语义模型...");
+
+  try {
+    await invoke("start_model_download");
+    await pollModelDownloadStatus();
+    startModelDownloadPolling();
+  } catch (err) {
+    modelDownloadBtn.disabled = false;
+    modelDownloadBtn.textContent = "重新下载";
+    renderModelDownloadStatus({
+      state: "error",
+      progress: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      error: err?.message || "启动下载失败"
+    });
+    setStatus("模型下载启动失败");
+  }
+});
 deepseekApiKeyLink?.addEventListener("click", async () => {
   try {
     await open("https://platform.deepseek.com/api_keys");
@@ -2282,6 +2454,10 @@ settingsModalContent?.addEventListener("click", (event) => {
 });
 
 donateModalContent?.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+modelDownloadContent?.addEventListener("click", (event) => {
   event.stopPropagation();
 });
 
@@ -2358,6 +2534,9 @@ document.documentElement.style.setProperty("--font-size", "14px");
 async function waitBackendReady() {
   let base;
   try {
+    await invoke("ensure_backend_started");
+  } catch (_) {}
+  try {
     base = await getApiBase();
   } catch (_) {
     setStatus("Backend port unavailable");
@@ -2397,10 +2576,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   syncAppTitle();
   autoResizeInput();
 
-  const backendReady = await waitBackendReady();
-  if (backendReady) {
-    await loadStartupPreferences();
-    await maybeAdviseBasicMaterial();
+  const modelReady = await ensureModelReady();
+  if (modelReady) {
+    const backendReady = await waitBackendReady();
+    if (backendReady) {
+      await loadStartupPreferences();
+      await maybeAdviseBasicMaterial();
+    }
   }
   updateApiKeyNotice();   // ✅ 只显示提示，不弹窗
 });
