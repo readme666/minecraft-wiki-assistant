@@ -3,7 +3,7 @@ import random
 import re
 import requests
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 import time
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -14,8 +14,8 @@ try:
 except Exception:
     BeautifulSoup = None
     NavigableString = str
-    Tag = object
     _HAS_BS4 = False
+_BS4_PARSER = "html.parser"
 try:
     import mwparserfromhell  # type: ignore
     _HAS_MW = True
@@ -36,6 +36,7 @@ _expand_cache: OrderedDict[str, str] = OrderedDict()
 PARSE_CACHE_FILE = Path("parse_cache.jsonl")
 PARSE_CACHE_MAX = 2000
 _parse_cache: OrderedDict[str, Dict] = OrderedDict()
+_parse_cache_lock = threading.Lock()
 
 # 内存 LRU cache
 _expand_cache_mem: OrderedDict[str, str] = OrderedDict()
@@ -123,10 +124,6 @@ def _parse_cache_append(k: str, v: Dict) -> None:
         except Exception:
             pass
 
-# 程序启动时加载一次（想禁用磁盘缓存就把这一行注释掉）
-_expand_cache_load()
-_parse_cache_load()
-
 SESSION = requests.Session()
 
 
@@ -144,12 +141,30 @@ API_BACKOFF = 1.6
 API_TIMEOUT = 60
 MAX_WORKERS = 6
 MAX_PENDING = MAX_WORKERS * 4
+CACHE_VERSION = "v2"
 _thread_local = threading.local()
-_parse_cache_lock = threading.Lock()
 SESSION.headers.update({
     "User-Agent": UA,
     "Accept": "application/json",
 })
+
+
+def _validate_runtime() -> None:
+    missing: List[str] = []
+    if not _HAS_BS4:
+        missing.append("beautifulsoup4")
+    if not _HAS_MW:
+        missing.append("mwparserfromhell")
+    if missing:
+        raise RuntimeError(
+            "Missing required dependencies: "
+            + ", ".join(missing)
+            + ". Install them on all machines to keep parsing deterministic."
+        )
+
+# 程序启动时加载一次（想禁用磁盘缓存就把这一行注释掉）
+_expand_cache_load()
+_parse_cache_load()
 
 
 def _get_session() -> requests.Session:
@@ -362,11 +377,11 @@ _SKIP_BLOCK_CLASSES = {
 }
 
 
-def _node_text(node: Tag) -> str:
+def _node_text(node: Any) -> str:
     return re.sub(r"\s+", " ", " ".join(node.stripped_strings)).strip()
 
 
-def _is_heading_node(node: Tag) -> bool:
+def _is_heading_node(node: Any) -> bool:
     if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
         return True
     classes = set(node.get("class", []))
@@ -375,7 +390,7 @@ def _is_heading_node(node: Tag) -> bool:
     return False
 
 
-def _extract_heading(node: Tag) -> Optional[Tuple[str, int]]:
+def _extract_heading(node: Any) -> Optional[Tuple[str, int]]:
     heading = node if re.fullmatch(r"h[1-6]", node.name or "") else node.find(re.compile(r"^h[1-6]$"))
     if heading is None:
         return None
@@ -389,7 +404,7 @@ def _extract_heading(node: Tag) -> Optional[Tuple[str, int]]:
     return title, level
 
 
-def _should_skip_block(node: Tag) -> bool:
+def _should_skip_block(node: Any) -> bool:
     classes = set(node.get("class", []))
     if classes & _SKIP_BLOCK_CLASSES:
         return True
@@ -398,7 +413,7 @@ def _should_skip_block(node: Tag) -> bool:
     return False
 
 
-def _parse_html_table(table: Tag) -> List[str]:
+def _parse_html_table(table: Any) -> List[str]:
     classes = set(table.get("class", []))
     if classes & _SKIP_TABLE_CLASSES:
         return []
@@ -451,7 +466,7 @@ def _parse_html_table(table: Tag) -> List[str]:
     return out
 
 
-def _render_html_block(node: Tag) -> List[str]:
+def _render_html_block(node: Any) -> List[str]:
     if _should_skip_block(node):
         return []
 
@@ -485,7 +500,7 @@ def _render_html_block(node: Tag) -> List[str]:
         for child in node.children:
             if isinstance(child, NavigableString):
                 continue
-            if not isinstance(child, Tag):
+            if BeautifulSoup is not None and not hasattr(child, "name"):
                 continue
             lines.extend(_render_html_block(child))
         if lines:
@@ -496,7 +511,7 @@ def _render_html_block(node: Tag) -> List[str]:
 
 
 def _html_to_sections(html: str) -> List[Dict]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, _BS4_PARSER)
     for node in soup.select("style, script, noscript, sup.reference, .mw-editsection, .reference, .reflist"):
         node.decompose()
 
@@ -528,7 +543,7 @@ def _html_to_sections(html: str) -> List[Dict]:
     for child in root.children:
         if isinstance(child, NavigableString):
             continue
-        if not isinstance(child, Tag):
+        if BeautifulSoup is not None and not hasattr(child, "name"):
             continue
 
         if _is_heading_node(child):
@@ -1144,7 +1159,7 @@ def _convert_sections(page_title: str, sections) -> List[Dict]:
 
 
 def fetch_page_record(page_title: str) -> Optional[Dict]:
-    cache_key = f"page::{page_title}"
+    cache_key = f"{CACHE_VERSION}:page::{page_title}"
     cached = _parse_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -1176,8 +1191,13 @@ def fetch_page_record(page_title: str) -> Optional[Dict]:
     text = ""
 
     if html and _HAS_BS4:
-        sections = _html_to_sections(html)
-        text = _sections_to_page_text(sections)
+        try:
+            sections = _html_to_sections(html)
+            text = _sections_to_page_text(sections)
+        except Exception as e:
+            print(f"  html parse failed {page_title}: {e}")
+            sections = []
+            text = ""
 
     if not text and raw:
         text = clean_wikitext(raw)
@@ -1205,32 +1225,43 @@ def _drain_completed(
     fout,
     *,
     block: bool,
-) -> int:
+) -> Tuple[int, int, int]:
     if not pending:
-        return 0
+        return 0, 0, 0
 
     timeout = None if block else 0
     done, _ = wait(pending.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
     written = 0
+    failed = 0
+    total_bytes = 0
     for future in done:
         page_title = pending.pop(future)
         try:
             rec = future.result()
         except Exception as e:
             print(f"  worker failed {page_title}: {e}")
+            failed += 1
             continue
 
         if rec is None:
+            failed += 1
             continue
 
-        fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        fout.write(line)
         written += 1
-    return written
+        total_bytes += len(line.encode("utf-8"))
+    return written, failed, total_bytes
 
 
 def main():
     n = 0
+    failed = 0
+    total_titles = 0
+    total_bytes = 0
+    _validate_runtime()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"runtime: bs4={_HAS_BS4} mwparserfromhell={_HAS_MW} parser={_BS4_PARSER} workers={MAX_WORKERS} cache={CACHE_VERSION}")
 
     with OUT_FILE.open("w", encoding="utf-8") as fout, \
          TITLES_FILE.open("w", encoding="utf-8", newline="\n") as ftitles:
@@ -1238,6 +1269,7 @@ def main():
             pending: Dict[Future, str] = {}
 
             for idx, page_title in enumerate(iter_allpages_titles(), 1):
+                total_titles = idx
                 ftitles.write(page_title + "\n")
 
                 if idx % 50 == 0:
@@ -1246,16 +1278,25 @@ def main():
                 pending[executor.submit(fetch_page_record, page_title)] = page_title
 
                 if len(pending) >= MAX_PENDING:
-                    n += _drain_completed(pending, fout, block=True)
+                    wrote, missed, wrote_bytes = _drain_completed(pending, fout, block=True)
+                    n += wrote
+                    failed += missed
+                    total_bytes += wrote_bytes
 
                 if PAGE_SLEEP > 0:
                     time.sleep(PAGE_SLEEP)
 
             while pending:
-                n += _drain_completed(pending, fout, block=True)
+                wrote, missed, wrote_bytes = _drain_completed(pending, fout, block=True)
+                n += wrote
+                failed += missed
+                total_bytes += wrote_bytes
 
     print(f"\u2705 \u5b8c\u6210: {OUT_FILE} pages={n}")
     print(f"\u2705 titles: {TITLES_FILE}")
+    print(f"summary: titles={total_titles} written={n} failed={failed}")
+    if n:
+        print(f"summary_bytes: total={total_bytes} avg_per_page={total_bytes // n}")
 
 
 if __name__ == "__main__":

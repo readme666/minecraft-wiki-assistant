@@ -79,12 +79,6 @@ def normalize_trade_line(line: str, default_currency: str = "Emerald") -> str:
 
 
 def normalize_trade_lines(text: str, default_currency: str = "Emerald") -> str:
-    """
-    更激进地修复“交易记录被换行拆开”的情况：
-    - 一旦进入 trade（遇到 trade head），后续非空行默认都当作续行拼回去
-    - 只有遇到新的 trade head 或空行才 flush
-    这样可以吞掉你看到的那种：0.2 | maxTrades=...
-    """
     if not text:
         return ""
 
@@ -305,26 +299,12 @@ def chunk_trade_block(trade_lines: List[str], per_chunk: int = 10, overlap_trade
     return chunks
 
 
-def chunk_structured_block(lines: List[str], per_chunk: int = 12, overlap_lines: int = 1) -> List[str]:
+def chunk_structured_block(lines: List[str]) -> List[str]:
     if not lines:
         return []
 
-    chunks: List[str] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        j = min(i + per_chunk, n)
-        blk = "\n".join(lines[i:j]).strip()
-        if blk:
-            chunks.append(blk)
-
-        if j >= n:
-            break
-        i = max(0, j - overlap_lines)
-        if i == j:
-            i = j
-
-    return chunks
+    blk = "\n".join(lines).strip()
+    return [blk] if blk else []
 
 
 def chunk_mixed_text(text: str, chunk_size: int = 900, overlap: int = 150,
@@ -357,13 +337,7 @@ def chunk_mixed_text(text: str, chunk_size: int = 900, overlap: int = 150,
     def flush_structured():
         nonlocal structured_buf
         if structured_buf:
-            out_chunks.extend(
-                chunk_structured_block(
-                    structured_buf,
-                    per_chunk=structured_per_chunk,
-                    overlap_lines=structured_overlap,
-                )
-            )
+            out_chunks.extend(chunk_structured_block(structured_buf))
             structured_buf = []
 
     for ln in lines:
@@ -407,8 +381,6 @@ def chunk_text_with_tables(text: str, chunk_size: int = 900, overlap: int = 150)
         else:
             md = parse_wikitable_to_markdown(seg) or seg.strip()
             table_chunk = "[WIKITABLE]\n" + md + "\n[/WIKITABLE]"
-            if len(table_chunk) > 2200:
-                table_chunk = table_chunk[:2200] + "…"
             chunks.append(table_chunk)
     return chunks
 
