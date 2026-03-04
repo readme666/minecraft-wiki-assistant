@@ -1,6 +1,6 @@
 # MineRAG 
 
-[123网盘下载](https://github.com/readme666/minecraft-wiki-assistant/releases)
+[123网盘下载](https://www.123865.com/s/dR9STd-JvJD3?pwd=RAE3#)
 
 
 ![LOGO](tauri-app/src/public/backround.png)
