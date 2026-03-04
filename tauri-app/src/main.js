@@ -1796,8 +1796,26 @@ const ERROR_ICON = `
 
 function getCopyTextFromBubble(bubble) {
   const clone = bubble.cloneNode(true);
-  clone.querySelectorAll(".refs, .footer, .dots").forEach((node) => node.remove());
+  clone.querySelectorAll(".refs, .footer, .dots, .thinking-sheen").forEach((node) => node.remove());
   return clone.textContent.trim();
+}
+
+function setThinkingBubbleText(bubble, text) {
+  if (!bubble) {
+    return;
+  }
+  const nextText = text ?? "";
+  const label = bubble.querySelector(".thinking-label");
+  const sheen = bubble.querySelector(".thinking-sheen");
+  if (label) {
+    label.textContent = nextText;
+  }
+  if (sheen) {
+    sheen.textContent = nextText;
+  }
+  if (!label && !sheen) {
+    bubble.textContent = nextText;
+  }
 }
 
 async function writeTextToClipboard(text) {
@@ -1848,10 +1866,23 @@ function createMessageRow(role, text, status, animate = true) {
   if (status === "thinking") {
     bubble.classList.add("thinking");
   }
-  bubble.textContent = text;
+  if (status === "thinking") {
+    const label = document.createElement("span");
+    label.className = "thinking-label";
+    label.textContent = text;
+
+    const sheen = document.createElement("span");
+    sheen.className = "thinking-sheen";
+    sheen.setAttribute("aria-hidden", "true");
+    sheen.textContent = text;
+
+    bubble.appendChild(label);
+    bubble.appendChild(sheen);
+  } else {
+    bubble.textContent = text;
+  }
 
   if (status === "thinking") {
-    bubble.dataset.thinkingText = text;
     const dots = document.createElement("span");
     dots.className = "dots";
     dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
@@ -2161,8 +2192,7 @@ async function sendMessage() {
         }
         if (!streamedAnswerText && assistantMsg.bubble.classList.contains("thinking")) {
           if (nextText.trim() !== "") {
-            assistantMsg.bubble.dataset.thinkingText = nextText;
-            assistantMsg.bubble.textContent = nextText;
+            setThinkingBubbleText(assistantMsg.bubble, nextText);
           }
         } else if (!streamedAnswerText) {
           assistantMsg.bubble.textContent = nextText;
