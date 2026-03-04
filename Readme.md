@@ -7,6 +7,9 @@
 
 MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 
+如果您喜欢本项目，请给我star。这是我持续开发的最大动力。
+
+
 它的检索、向量索引和 Embedding 都在本地完成，问答生成通过 DeepSeek API 完成。项目同时提供：
 
 - Tauri 桌面前端
