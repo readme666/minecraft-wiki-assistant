@@ -1,4 +1,4 @@
-# MineRAG
+# MineRAG [下载](https://github.com/readme666/minecraft-wiki-assistant/releases)
 ![LOGO](tauri-app/src/public/backround.png)
 
 MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
