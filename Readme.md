@@ -22,42 +22,13 @@ MineRAG 是一个面向 Minecraft 中文 Wiki 的本地 RAG 问答工具。
 
 ![Whole_Process](Whole_Process.png)
 
-## RAG流程图
+## 后端RAG流程图
 
 ![RAG](RAG.png)
 
-## 仓库结构
+## data_pipeline流程图
 
-
-```text
-.
-├─ backend/
-│  ├─ backend.py
-│  └─ rag_cli.py
-├─ data_pipeline/
-│  ├─ 01get_titles_parsed.py
-│  ├─ 02parsedtochunk.py
-│  └─ 03buildindex.py
-├─ pyserver/
-│  ├─ requirements.txt
-│  └─ server.py
-├─ tauri-app/
-│  ├─ package.json
-│  ├─ src/
-│  └─ src-tauri/
-├─ config.py
-├─ logging_utils.py
-├─ build.ps1
-└─ Readme.md
-```
-
-说明：
-
-- `backend/`：核心问答与检索逻辑。
-- `pyserver/`：FastAPI 服务，供 Tauri 前端调用。
-- `data_pipeline/`：Wiki 数据解析、切块、建索引流程。
-- `tauri-app/`：桌面端前端与 Tauri 壳。
-- `build.ps1`：给自行编译用户的一键构建脚本。
+![data_pipeline](data_pipeline.png)
 
 ## 运行方式
 
@@ -128,39 +99,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
 如果系统中没有 Python，或 Python 版本低于 3.10，脚本会直接提示并退出。
-
-## 数据构建流程
-
-当前仓库中的数据流程由以下 3 个脚本组成：
-
-```text
-data_pipeline/01get_titles_parsed.py
-data_pipeline/02parsedtochunk.py
-data_pipeline/03buildindex.py
-```
-
-它们的职责分别是：
-
-1. `01get_titles_parsed.py`
-   从 Minecraft 中文 Wiki 拉取页面内容，生成解析后的 `jsonl` 数据。
-2. `02parsedtochunk.py`
-   将解析后的页面切分为适合检索的 chunks。
-3. `03buildindex.py`
-   对 chunks 生成 embedding，并构建 FAISS 索引与元数据文件。
-
-最终会生成的核心产物通常包括：
-
-```text
-data/data_parsed.jsonl
-chunks/chunks_all.jsonl
-index/faiss_all.index
-index/meta_all.jsonl
-```
-
-说明：
-
-- `01get_titles_parsed.py` 需要联网访问 Minecraft 中文 Wiki API。
-- `03buildindex.py` 首次运行可能会下载 Hugging Face 模型，耗时较长。
 
 ## 桌面端构建结果
 
